@@ -4,9 +4,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TokenizerCacheConfig,
-    TraceConfig,
+    HistoryBackend, KafkaUsageConfig, MemoryRuntimeConfig, MetricsConfig, OracleConfig,
+    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+    RoutingMode, SkillsConfig, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::ConnectionMode;
 
@@ -576,6 +576,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_trace(mut self, trace_config: Option<TraceConfig>) -> Self {
         self.config.trace_config = trace_config;
+        self
+    }
+
+    pub fn kafka_usage(mut self, kafka_usage: KafkaUsageConfig) -> Self {
+        self.config.kafka_usage = kafka_usage;
         self
     }
 

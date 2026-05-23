@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use arc_swap::ArcSwap;
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{HealthCheckConfig, ProviderType, WorkerModels, WorkerSpec, WorkerStatus},
 };
 
 use super::{
@@ -205,6 +205,24 @@ impl BasicWorkerBuilder {
     /// Set worker cost factor (baseline = 1.0)
     pub fn cost(mut self, cost: f32) -> Self {
         self.spec.cost = cost;
+        self
+    }
+
+    /// Set relative routing weight for weighted policies.
+    pub fn routing_weight(mut self, weight: u32) -> Self {
+        self.spec.routing_weight = weight;
+        self
+    }
+
+    /// Set backend-specific served model name for forwarded OpenAI requests.
+    pub fn served_model_name(mut self, name: impl Into<String>) -> Self {
+        self.spec.served_model_name = Some(name.into());
+        self
+    }
+
+    /// Set external provider type for OpenAI-compatible routing.
+    pub fn provider(mut self, provider: ProviderType) -> Self {
+        self.spec.provider = Some(provider);
         self
     }
 

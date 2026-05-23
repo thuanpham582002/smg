@@ -23,7 +23,13 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    observability::{
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        usage_events::{
+            capture_body, publish_non_streaming_response, wrap_streaming_response, TokenInfo,
+            UsageEventContext, UsageEventPublisher,
+        },
+    },
     routers::{
         common::worker_selection::{SelectWorkerRequest, WorkerSelector},
         error,
@@ -36,6 +42,11 @@ pub(in crate::routers::openai) struct ResponsesRouterContext<'a> {
     pub worker_registry: &'a WorkerRegistry,
     pub provider_registry: &'a ProviderRegistry,
     pub responses_components: &'a Arc<ResponsesComponents>,
+    pub usage_event_publisher: &'a Arc<dyn UsageEventPublisher>,
+    pub kafka_event_header_keys: &'a [String],
+    pub kafka_capture_request_body: bool,
+    pub kafka_capture_response_body: bool,
+    pub kafka_body_capture_max_bytes: usize,
 }
 
 /// Route a responses API request to the appropriate upstream worker.
@@ -49,6 +60,14 @@ pub(in crate::routers::openai) async fn route_responses(
     let start = Instant::now();
     let model = model_id;
     let streaming = body.stream.unwrap_or(false);
+    let request_body_capture = deps
+        .kafka_capture_request_body
+        .then(|| {
+            serde_json::to_vec(body)
+                .ok()
+                .and_then(|body| capture_body(&body, deps.kafka_body_capture_max_bytes))
+        })
+        .flatten();
 
     Metrics::record_router_request(
         metrics_labels::ROUTER_OPENAI,
@@ -81,6 +100,22 @@ pub(in crate::routers::openai) async fn route_responses(
                 metrics_labels::ENDPOINT_RESPONSES,
                 metrics_labels::ERROR_NO_WORKERS,
             );
+            let usage_ctx = UsageEventContext::unrouted(
+                headers,
+                deps.kafka_event_header_keys,
+                "/v1/responses",
+                model,
+                streaming,
+                start,
+            );
+            deps.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some("no_workers"),
+            ));
             return response;
         }
     };
@@ -103,10 +138,28 @@ pub(in crate::routers::openai) async fn route_responses(
             metrics_labels::ENDPOINT_RESPONSES,
             metrics_labels::ERROR_VALIDATION,
         );
-        return error::bad_request(
+        let response = error::bad_request(
             "invalid_request",
             "Cannot specify both 'conversation' and 'previous_response_id'".to_string(),
         );
+        let usage_ctx = UsageEventContext::from_request(
+            headers,
+            deps.kafka_event_header_keys,
+            "/v1/responses",
+            model,
+            worker.as_ref(),
+            streaming,
+            start,
+        );
+        deps.usage_event_publisher.publish(usage_ctx.build_event(
+            response.status(),
+            None,
+            TokenInfo::default(),
+            None,
+            None,
+            Some("invalid_request"),
+        ));
+        return response;
     }
 
     let mut request_body = body.clone();
@@ -122,7 +175,26 @@ pub(in crate::routers::openai) async fn route_responses(
     .await
     {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(response) => {
+            let usage_ctx = UsageEventContext::from_request(
+                headers,
+                deps.kafka_event_header_keys,
+                "/v1/responses",
+                model,
+                worker.as_ref(),
+                streaming,
+                start,
+            );
+            deps.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some("load_input_history_failed"),
+            ));
+            return response;
+        }
     };
 
     request_body.store = Some(false);
@@ -141,10 +213,28 @@ pub(in crate::routers::openai) async fn route_responses(
                 metrics_labels::ENDPOINT_RESPONSES,
                 metrics_labels::ERROR_VALIDATION,
             );
-            return error::bad_request(
+            let response = error::bad_request(
                 "invalid_request",
                 format!("Failed to serialize request: {e}"),
             );
+            let usage_ctx = UsageEventContext::from_request(
+                headers,
+                deps.kafka_event_header_keys,
+                "/v1/responses",
+                model,
+                worker.as_ref(),
+                streaming,
+                start,
+            );
+            deps.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some("invalid_request"),
+            ));
+            return response;
         }
     };
 
@@ -158,8 +248,42 @@ pub(in crate::routers::openai) async fn route_responses(
             metrics_labels::ENDPOINT_RESPONSES,
             metrics_labels::ERROR_VALIDATION,
         );
-        return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
+        let response =
+            error::bad_request("invalid_request", format!("Provider transform error: {e}"));
+        let usage_ctx = UsageEventContext::from_request(
+            headers,
+            deps.kafka_event_header_keys,
+            "/v1/responses",
+            model,
+            worker.as_ref(),
+            streaming,
+            start,
+        );
+        deps.usage_event_publisher.publish(usage_ctx.build_event(
+            response.status(),
+            None,
+            TokenInfo::default(),
+            None,
+            None,
+            Some("invalid_request"),
+        ));
+        return response;
     }
+
+    let usage_ctx = UsageEventContext::from_request(
+        headers,
+        deps.kafka_event_header_keys,
+        "/v1/responses",
+        model,
+        worker.as_ref(),
+        streaming,
+        start,
+    )
+    .with_audit_capture(
+        request_body_capture,
+        deps.kafka_capture_response_body,
+        deps.kafka_body_capture_max_bytes,
+    );
 
     let mut ctx = RequestContext::for_responses(
         Arc::new(body.clone()),
@@ -201,7 +325,12 @@ pub(in crate::routers::openai) async fn route_responses(
         );
     }
 
-    response
+    if streaming {
+        wrap_streaming_response(response, usage_ctx, deps.usage_event_publisher.clone())
+    } else {
+        publish_non_streaming_response(response, usage_ctx, deps.usage_event_publisher.clone())
+            .await
+    }
 }
 
 #[cfg(test)]

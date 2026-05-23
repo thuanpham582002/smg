@@ -13,7 +13,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::tenant::DataPlaneCaller;
+use crate::{observability::metrics::Metrics, tenant::DataPlaneCaller};
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -52,14 +52,19 @@ pub async fn auth_middleware(
             .as_ref()
             .is_some_and(|digest| digest.ct_eq(expected_hash).unwrap_u8() == 1);
         if !authorized {
+            Metrics::record_data_plane_auth("api_key", "deny");
             return StatusCode::UNAUTHORIZED.into_response();
         }
+
+        Metrics::record_data_plane_auth("api_key", "allow");
 
         if let Some(token_hash) = token_hash {
             request
                 .extensions_mut()
                 .insert(DataPlaneCaller::authenticated_from_sha256(token_hash));
         }
+    } else {
+        Metrics::record_data_plane_auth("disabled", "allow");
     }
 
     next.run(request).await

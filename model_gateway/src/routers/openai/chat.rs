@@ -21,7 +21,13 @@ use super::{
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    observability::{
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        usage_events::{
+            capture_body, publish_non_streaming_response, wrap_streaming_response, TokenInfo,
+            UsageEventContext, UsageEventPublisher,
+        },
+    },
     routers::{
         common::{
             header_utils::{apply_provider_headers, extract_auth_header},
@@ -39,6 +45,11 @@ pub(super) struct ChatRouterContext<'a> {
     pub provider_registry: &'a ProviderRegistry,
     pub shared_components: &'a Arc<SharedComponents>,
     pub retry_config: &'a RetryConfig,
+    pub usage_event_publisher: &'a Arc<dyn UsageEventPublisher>,
+    pub kafka_event_header_keys: &'a [String],
+    pub kafka_capture_request_body: bool,
+    pub kafka_capture_response_body: bool,
+    pub kafka_body_capture_max_bytes: usize,
 }
 
 /// Route a chat completion request to the appropriate upstream worker.
@@ -52,6 +63,14 @@ pub(super) async fn route_chat(
     let start = Instant::now();
     let model = model_id;
     let streaming = body.stream;
+    let request_body_capture = deps
+        .kafka_capture_request_body
+        .then(|| {
+            serde_json::to_vec(body)
+                .ok()
+                .and_then(|body| capture_body(&body, deps.kafka_body_capture_max_bytes))
+        })
+        .flatten();
 
     Metrics::record_router_request(
         metrics_labels::ROUTER_OPENAI,
@@ -82,6 +101,22 @@ pub(super) async fn route_chat(
                 metrics_labels::ENDPOINT_CHAT,
                 metrics_labels::ERROR_NO_WORKERS,
             );
+            let usage_ctx = UsageEventContext::unrouted(
+                headers,
+                deps.kafka_event_header_keys,
+                "/v1/chat/completions",
+                model,
+                streaming,
+                start,
+            );
+            deps.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some("no_workers"),
+            ));
             return response;
         }
     };
@@ -97,10 +132,28 @@ pub(super) async fn route_chat(
                 metrics_labels::ENDPOINT_CHAT,
                 metrics_labels::ERROR_VALIDATION,
             );
-            return error::bad_request(
+            let response = error::bad_request(
                 "invalid_request",
                 format!("Failed to serialize request: {e}"),
             );
+            let usage_ctx = UsageEventContext::from_request(
+                headers,
+                deps.kafka_event_header_keys,
+                "/v1/chat/completions",
+                model,
+                worker.as_ref(),
+                streaming,
+                start,
+            );
+            deps.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some("invalid_request"),
+            ));
+            return response;
         }
     };
 
@@ -117,8 +170,42 @@ pub(super) async fn route_chat(
             metrics_labels::ENDPOINT_CHAT,
             metrics_labels::ERROR_VALIDATION,
         );
-        return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
+        let response =
+            error::bad_request("invalid_request", format!("Provider transform error: {e}"));
+        let usage_ctx = UsageEventContext::from_request(
+            headers,
+            deps.kafka_event_header_keys,
+            "/v1/chat/completions",
+            model,
+            worker.as_ref(),
+            streaming,
+            start,
+        );
+        deps.usage_event_publisher.publish(usage_ctx.build_event(
+            response.status(),
+            None,
+            TokenInfo::default(),
+            None,
+            None,
+            Some("invalid_request"),
+        ));
+        return response;
     }
+
+    let usage_ctx = UsageEventContext::from_request(
+        headers,
+        deps.kafka_event_header_keys,
+        "/v1/chat/completions",
+        model,
+        worker.as_ref(),
+        streaming,
+        start,
+    )
+    .with_audit_capture(
+        request_body_capture,
+        deps.kafka_capture_response_body,
+        deps.kafka_body_capture_max_bytes,
+    );
 
     let mut ctx = RequestContext::for_chat(
         Arc::new(body.clone()),
@@ -276,5 +363,191 @@ pub(super) async fn route_chat(
         );
     }
 
-    response
+    if streaming {
+        wrap_streaming_response(response, usage_ctx, deps.usage_event_publisher.clone())
+    } else {
+        publish_non_streaming_response(response, usage_ctx, deps.usage_event_publisher.clone())
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::to_bytes;
+    use openai_protocol::{
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, ProviderType},
+    };
+
+    use super::*;
+    use crate::{
+        config::types::{PolicyConfig, RetryConfig, RouterConfig},
+        middleware::{RouteRequestMeta, TenantKey},
+        observability::usage_events::{UsageEvent, UsageEventPublisher},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturingUsageEventPublisher {
+        events: Arc<Mutex<Vec<UsageEvent>>>,
+    }
+
+    impl CapturingUsageEventPublisher {
+        fn events(&self) -> Vec<UsageEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl UsageEventPublisher for CapturingUsageEventPublisher {
+        fn publish(&self, event: UsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    fn test_tenant_meta() -> RouteRequestMeta {
+        RouteRequestMeta::new(TenantKey::from("test-tenant"))
+    }
+
+    fn test_chat_request(stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-public".to_string(),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_chat_non_streaming_publishes_usage_event() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "model": "llama-real",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = WorkerRegistry::new();
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .provider(ProviderType::OpenAI)
+            .model(ModelCard::new("gpt-public"))
+            .served_model_name("llama-real")
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let router_config = Arc::new(RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            ..Default::default()
+        });
+        let shared_components = Arc::new(SharedComponents {
+            client: reqwest::Client::new(),
+            router_config,
+        });
+        let publisher = CapturingUsageEventPublisher::default();
+        let publisher_arc: Arc<dyn UsageEventPublisher> = Arc::new(publisher.clone());
+        let header_keys = vec!["x-project-id".to_string(), "x-model-id".to_string()];
+        let deps = ChatRouterContext {
+            worker_registry: &worker_registry,
+            provider_registry: &ProviderRegistry::new(),
+            shared_components: &shared_components,
+            retry_config: &RetryConfig::default(),
+            usage_event_publisher: &publisher_arc,
+            kafka_event_header_keys: &header_keys,
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-project-id", HeaderValue::from_static("project-1"));
+        headers.insert("x-model-id", HeaderValue::from_static("model-1"));
+
+        let response = route_chat(
+            &deps,
+            Some(&headers),
+            &test_tenant_meta(),
+            &test_chat_request(false),
+            "gpt-public",
+        )
+        .await;
+        assert!(response.status().is_success());
+        let _body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.operation, "chat");
+        assert_eq!(event.original_model, "gpt-public");
+        assert_eq!(event.request_model, "llama-real");
+        assert_eq!(event.response_model, "llama-real");
+        assert_eq!(event.model_name_override, "llama-real");
+        assert_eq!(event.tokens.input_tokens, 4);
+        assert_eq!(event.tokens.output_tokens, 6);
+        assert_eq!(event.tokens.total_tokens, 10);
+        assert_eq!(event.x_project_id.as_deref(), Some("project-1"));
+        assert_eq!(event.x_model_id.as_deref(), Some("model-1"));
+    }
+
+    #[tokio::test]
+    async fn openai_chat_no_worker_publishes_failure_event() {
+        let worker_registry = WorkerRegistry::new();
+        let router_config = Arc::new(RouterConfig::default());
+        let shared_components = Arc::new(SharedComponents {
+            client: reqwest::Client::new(),
+            router_config,
+        });
+        let publisher = CapturingUsageEventPublisher::default();
+        let publisher_arc: Arc<dyn UsageEventPublisher> = Arc::new(publisher.clone());
+        let deps = ChatRouterContext {
+            worker_registry: &worker_registry,
+            provider_registry: &ProviderRegistry::new(),
+            shared_components: &shared_components,
+            retry_config: &RetryConfig::default(),
+            usage_event_publisher: &publisher_arc,
+            kafka_event_header_keys: &[],
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+
+        let response = route_chat(
+            &deps,
+            None,
+            &test_tenant_meta(),
+            &test_chat_request(false),
+            "missing-model",
+        )
+        .await;
+        assert!(!response.status().is_success());
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+        assert_eq!(events[0].error_type, "no_workers");
+        assert_eq!(events[0].original_model, "missing-model");
+    }
 }

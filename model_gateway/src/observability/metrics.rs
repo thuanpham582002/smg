@@ -388,6 +388,10 @@ pub(crate) fn init_metrics() {
         "Active database connections by storage_type"
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
+    describe_counter!(
+        "smg_usage_events_total",
+        "Kafka-compatible usage event publish outcomes by backend and result"
+    );
 
     // Multimodal tensor transport (shm vs inline), labeled by runtime.
     describe_counter!(
@@ -1115,6 +1119,68 @@ impl Metrics {
         counter!(
             "smg_consistent_hashing_policy_branch_total",
             "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record weighted sticky policy execution branch for routing decisions
+    pub fn record_worker_weighted_sticky_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_weighted_sticky_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record model rewrite outcomes before forwarding requests to workers
+    pub fn record_model_rewrite(public_model: &str, served_model: &str, result: &'static str) {
+        let public_model = intern_string(public_model);
+        let served_model = intern_string(served_model);
+        counter!(
+            "smg_model_rewrite_total",
+            "public_model" => public_model,
+            "served_model" => served_model,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record model-aware backend route decisions
+    pub fn record_model_backend_route(
+        public_model: &str,
+        selected_backend: &str,
+        served_model: &str,
+        policy: &'static str,
+    ) {
+        let public_model = intern_string(public_model);
+        let selected_backend = intern_string(selected_backend);
+        let served_model = intern_string(served_model);
+        counter!(
+            "smg_model_backend_route_total",
+            "public_model" => public_model,
+            "selected_backend" => selected_backend,
+            "served_model" => served_model,
+            "policy" => policy
+        )
+        .increment(1);
+    }
+
+    /// Record data-plane authentication decisions before routing
+    pub fn record_data_plane_auth(method: &'static str, result: &'static str) {
+        counter!(
+            "smg_data_plane_auth_total",
+            "method" => method,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record Kafka-compatible usage event publish outcomes.
+    pub fn record_usage_event_publish(backend: &'static str, result: &'static str) {
+        counter!(
+            "smg_usage_events_total",
+            "backend" => backend,
+            "result" => result
         )
         .increment(1);
     }

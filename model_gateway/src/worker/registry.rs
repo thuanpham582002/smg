@@ -1074,7 +1074,11 @@ impl WorkerRegistry {
         let mut model_ids: Vec<String> = worker
             .models()
             .into_iter()
-            .map(|model| model.id)
+            .flat_map(|model| {
+                std::iter::once(model.id)
+                    .chain(model.aliases)
+                    .collect::<Vec<String>>()
+            })
             .filter(|model_id| seen.insert(model_id.clone()))
             .collect();
 
@@ -2270,6 +2274,26 @@ mod tests {
         assert!(registry.get_by_model("gpt-4o").is_empty());
         assert_eq!(registry.get_by_model("o3").len(), 1);
         assert_eq!(registry.get_by_model("o4-mini").len(), 1);
+    }
+
+    #[test]
+    fn test_model_aliases_are_indexed_for_routing() {
+        let registry = WorkerRegistry::new();
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("https://backend.local")
+                .worker_type(WorkerType::Regular)
+                .models(vec![
+                    ModelCard::new("llama-3.1-8b-real").with_alias("gpt-public")
+                ])
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+
+        registry.register(worker).unwrap();
+
+        assert_eq!(registry.get_by_model("llama-3.1-8b-real").len(), 1);
+        assert_eq!(registry.get_by_model("gpt-public").len(), 1);
     }
 
     #[test]

@@ -50,6 +50,8 @@ pub struct RouterConfig {
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
+    #[serde(default)]
+    pub kafka_usage: KafkaUsageConfig,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
@@ -350,6 +352,9 @@ pub enum PolicyConfig {
     #[serde(rename = "passthrough")]
     Passthrough,
 
+    #[serde(rename = "weighted_sticky")]
+    WeightedSticky,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -493,6 +498,7 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::Passthrough => "passthrough",
+            PolicyConfig::WeightedSticky => "weighted_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad { .. } => "least_load",
@@ -683,6 +689,129 @@ impl Default for TraceConfig {
     }
 }
 
+/// Kafka usage-event publishing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct KafkaUsageConfig {
+    /// Comma-separated broker list. Empty disables publishing.
+    pub brokers: Vec<String>,
+    pub topic: String,
+    /// Explicit request headers copied into usage event payloads.
+    pub event_header_keys: Vec<String>,
+    pub sasl_user: Option<String>,
+    pub sasl_password: Option<String>,
+    pub sasl_mechanism: Option<String>,
+    pub tls_enabled: bool,
+    /// Opt-in request body capture for audit/debug. Disabled by default.
+    pub capture_request_body: bool,
+    /// Opt-in response body capture for audit/debug. Disabled by default.
+    pub capture_response_body: bool,
+    /// Maximum captured bytes per body field.
+    pub body_capture_max_bytes: usize,
+}
+
+impl KafkaUsageConfig {
+    pub fn from_env() -> Self {
+        let brokers = std::env::var("KAFKA_BROKERS")
+            .ok()
+            .map(|value| parse_csv_env(&value))
+            .unwrap_or_default();
+        let event_header_keys = std::env::var("KAFKA_EVENT_HEADER_KEYS")
+            .ok()
+            .map(|value| parse_csv_env(&value))
+            .unwrap_or_else(default_kafka_usage_header_keys);
+
+        Self {
+            brokers,
+            topic: std::env::var("KAFKA_TOPIC").unwrap_or_else(|_| default_kafka_usage_topic()),
+            event_header_keys,
+            sasl_user: std::env::var("KAFKA_SASL_USER")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            sasl_password: std::env::var("KAFKA_SASL_PASSWORD")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            sasl_mechanism: std::env::var("KAFKA_SASL_MECHANISM")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            tls_enabled: parse_bool_env("KAFKA_TLS_ENABLED"),
+            capture_request_body: parse_bool_env("KAFKA_CAPTURE_REQUEST_BODY"),
+            capture_response_body: parse_bool_env("KAFKA_CAPTURE_RESPONSE_BODY"),
+            body_capture_max_bytes: std::env::var("KAFKA_BODY_CAPTURE_MAX_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(default_kafka_body_capture_max_bytes()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.brokers.is_empty()
+    }
+}
+
+impl Default for KafkaUsageConfig {
+    fn default() -> Self {
+        Self {
+            brokers: Vec::new(),
+            topic: default_kafka_usage_topic(),
+            event_header_keys: default_kafka_usage_header_keys(),
+            sasl_user: None,
+            sasl_password: None,
+            sasl_mechanism: None,
+            tls_enabled: false,
+            capture_request_body: false,
+            capture_response_body: false,
+            body_capture_max_bytes: default_kafka_body_capture_max_bytes(),
+        }
+    }
+}
+
+fn default_kafka_usage_topic() -> String {
+    "ai-gateway-events".to_string()
+}
+
+fn default_kafka_body_capture_max_bytes() -> usize {
+    8192
+}
+
+fn default_kafka_usage_header_keys() -> Vec<String> {
+    [
+        "x-project-id",
+        "x-user-id",
+        "x-api-key-id",
+        "x-model-name",
+        "x-ai-eg-model",
+        "x-model-id",
+        "x-input-price",
+        "x-output-price",
+        "x-is-free",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn parse_csv_env(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -707,6 +836,7 @@ impl Default for RouterConfig {
             discovery: None,
             metrics: None,
             trace_config: None,
+            kafka_usage: KafkaUsageConfig::default(),
             log_dir: None,
             log_level: None,
             request_id_headers: None,
@@ -999,6 +1129,7 @@ mod tests {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
         assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
+        assert_eq!(PolicyConfig::WeightedSticky.name(), "weighted_sticky");
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
@@ -1023,6 +1154,10 @@ mod tests {
         let random = PolicyConfig::Random;
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
+
+        let weighted_sticky = PolicyConfig::WeightedSticky;
+        let json = serde_json::to_string(&weighted_sticky).unwrap();
+        assert_eq!(json, r#"{"type":"weighted_sticky"}"#);
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,

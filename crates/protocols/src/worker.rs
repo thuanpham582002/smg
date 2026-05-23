@@ -23,6 +23,7 @@ use super::model_card::ModelCard;
 
 pub const DEFAULT_WORKER_PRIORITY: u32 = 50;
 pub const DEFAULT_WORKER_COST: f32 = 1.0;
+pub const DEFAULT_ROUTING_WEIGHT: u32 = 1;
 
 // ── Enums ────────────────────────────────────────────────────────────
 
@@ -374,6 +375,10 @@ fn default_cost() -> f32 {
     DEFAULT_WORKER_COST
 }
 
+fn default_routing_weight() -> u32 {
+    DEFAULT_ROUTING_WEIGHT
+}
+
 fn default_health_check_timeout() -> u64 {
     30
 }
@@ -572,6 +577,11 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "WorkerModels::is_wildcard")]
     pub models: WorkerModels,
 
+    /// Backend-specific served model name to put in forwarded request bodies.
+    /// When unset, SMG forwards the client-provided model value unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_name: Option<String>,
+
     /// Worker type: regular, prefill, or decode.
     #[serde(default)]
     pub worker_type: WorkerType,
@@ -599,6 +609,10 @@ pub struct WorkerSpec {
     /// Worker cost factor (baseline = 1.0).
     #[serde(default = "default_cost")]
     pub cost: f32,
+
+    /// Relative routing weight for policies that support weighted selection.
+    #[serde(default = "default_routing_weight")]
+    pub routing_weight: u32,
 
     /// Worker API key. Accepted on input, never included in responses.
     #[serde(default, skip_serializing)]
@@ -672,6 +686,7 @@ impl WorkerSpec {
         Self {
             url: url.into(),
             models: WorkerModels::Wildcard,
+            served_model_name: None,
             worker_type: WorkerType::default(),
             connection_mode: ConnectionMode::default(),
             runtime_type: RuntimeType::default(),
@@ -679,6 +694,7 @@ impl WorkerSpec {
             labels: HashMap::new(),
             priority: DEFAULT_WORKER_PRIORITY,
             cost: DEFAULT_WORKER_COST,
+            routing_weight: default_routing_weight(),
             api_key: None,
             bootstrap_port: None,
             bootstrap_host: String::new(),
@@ -1265,7 +1281,7 @@ impl IntoResponse for WorkerLoadsResult {
 
 #[cfg(test)]
 mod worker_status_tests {
-    use super::WorkerStatus;
+    use super::{WorkerSpec, WorkerStatus};
 
     #[test]
     fn test_try_from_u8_draining() {
@@ -1312,6 +1328,26 @@ mod worker_status_tests {
         ] {
             assert_eq!(s.is_routable(), s == WorkerStatus::Ready, "{s:?}");
         }
+    }
+
+    #[test]
+    fn test_worker_spec_model_routing_fields_serde() {
+        let spec: WorkerSpec = serde_json::from_str(
+            r#"{
+                "url": "http://worker-a:8000",
+                "served_model_name": "llama-real-a",
+                "routing_weight": 80
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.served_model_name.as_deref(), Some("llama-real-a"));
+        assert_eq!(spec.routing_weight, 80);
+
+        let default_spec: WorkerSpec =
+            serde_json::from_str(r#"{"url": "http://worker-b:8000"}"#).unwrap();
+        assert_eq!(default_spec.served_model_name, None);
+        assert_eq!(default_spec.routing_weight, 1);
     }
 }
 

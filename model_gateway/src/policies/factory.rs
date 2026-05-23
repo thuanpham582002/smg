@@ -6,6 +6,7 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PassthroughPolicy,
     PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    WeightedStickyPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +20,7 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
+            PolicyConfig::WeightedSticky => Arc::new(WeightedStickyPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::LeastLoad {
                 kv_pressure_weight,
@@ -96,6 +98,7 @@ impl PolicyFactory {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "passthrough" => Some(Arc::new(PassthroughPolicy::new())),
+            "weighted_sticky" | "weightedsticky" => Some(Arc::new(WeightedStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
@@ -124,6 +127,9 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Passthrough);
         assert_eq!(policy.name(), "passthrough");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::WeightedSticky);
+        assert_eq!(policy.name(), "weighted_sticky");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
@@ -177,6 +183,8 @@ mod tests {
             "passthrough"
         );
         assert!(PolicyFactory::create_by_name("PASSTHROUGH").is_some());
+        assert!(PolicyFactory::create_by_name("weighted_sticky").is_some());
+        assert!(PolicyFactory::create_by_name("WeightedSticky").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());

@@ -17,7 +17,10 @@ use tracing::debug;
 use crate::{
     config::RouterConfig,
     middleware::TokenBucket,
-    observability::inflight_tracker::InFlightRequestTracker,
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        usage_events::{create_usage_event_publisher, UsageEventPublisher},
+    },
     policies::PolicyRegistry,
     routers::{
         common::openai_bridge::FormatRegistry, grpc::multimodal::MultimodalConfigRegistry,
@@ -71,6 +74,7 @@ pub struct AppContext {
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    pub usage_event_publisher: Arc<dyn UsageEventPublisher>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
@@ -107,6 +111,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    usage_event_publisher: Option<Arc<dyn UsageEventPublisher>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -160,6 +165,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            usage_event_publisher: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -272,6 +278,14 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn usage_event_publisher(
+        mut self,
+        usage_event_publisher: Arc<dyn UsageEventPublisher>,
+    ) -> Self {
+        self.usage_event_publisher = Some(usage_event_publisher);
+        self
+    }
+
     pub fn webrtc_bind_addr(mut self, addr: Option<std::net::IpAddr>) -> Self {
         self.webrtc_bind_addr = addr;
         self
@@ -331,6 +345,10 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
+        let usage_event_publisher = self
+            .usage_event_publisher
+            .unwrap_or_else(|| create_usage_event_publisher(&router_config));
+
         Ok(AppContext {
             client: self
                 .client
@@ -371,6 +389,7 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
+            usage_event_publisher,
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -403,6 +422,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
+            .usage_event_publisher(create_usage_event_publisher(&router_config))
             .webrtc_bind_addr(webrtc_bind_addr)
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),

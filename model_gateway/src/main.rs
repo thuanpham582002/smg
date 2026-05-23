@@ -5,9 +5,10 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
-        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
-        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, KafkaUsageConfig, ManualAssignmentMode,
+        MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TokenizerCacheConfig,
+        TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -164,7 +165,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "weighted_sticky", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -262,11 +263,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "weighted_sticky", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "weighted_sticky", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -353,6 +354,76 @@ struct CliArgs {
     /// Custom buckets for Prometheus duration metrics
     #[arg(long, num_args = 0.., help_heading = "Prometheus Metrics")]
     prometheus_duration_buckets: Vec<f64>,
+
+    // ==================== Kafka Usage Events ====================
+    /// Kafka broker list for AI Gateway-compatible usage events
+    #[arg(long, env = "KAFKA_BROKERS", value_delimiter = ',', num_args = 0.., help_heading = "Kafka Usage Events")]
+    kafka_brokers: Vec<String>,
+
+    /// Kafka topic for usage events
+    #[arg(
+        long,
+        env = "KAFKA_TOPIC",
+        default_value = "ai-gateway-events",
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_topic: String,
+
+    /// Request headers copied into usage events
+    #[arg(long, env = "KAFKA_EVENT_HEADER_KEYS", value_delimiter = ',', num_args = 0.., help_heading = "Kafka Usage Events")]
+    kafka_event_header_keys: Vec<String>,
+
+    /// Kafka SASL username
+    #[arg(long, env = "KAFKA_SASL_USER", help_heading = "Kafka Usage Events")]
+    kafka_sasl_user: Option<String>,
+
+    /// Kafka SASL password
+    #[arg(long, env = "KAFKA_SASL_PASSWORD", help_heading = "Kafka Usage Events")]
+    kafka_sasl_password: Option<String>,
+
+    /// Kafka SASL mechanism, e.g. PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    #[arg(
+        long,
+        env = "KAFKA_SASL_MECHANISM",
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_sasl_mechanism: Option<String>,
+
+    /// Enable TLS for Kafka producer connections
+    #[arg(
+        long,
+        env = "KAFKA_TLS_ENABLED",
+        default_value_t = false,
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_tls_enabled: bool,
+
+    /// Capture truncated request bodies in Kafka usage events. Disabled by default.
+    #[arg(
+        long,
+        env = "KAFKA_CAPTURE_REQUEST_BODY",
+        default_value_t = false,
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_capture_request_body: bool,
+
+    /// Capture truncated response bodies in Kafka usage events. Disabled by default.
+    #[arg(
+        long,
+        env = "KAFKA_CAPTURE_RESPONSE_BODY",
+        default_value_t = false,
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_capture_response_body: bool,
+
+    /// Maximum bytes captured for each request/response body in usage events
+    #[arg(
+        long,
+        env = "KAFKA_BODY_CAPTURE_MAX_BYTES",
+        default_value_t = 8192,
+        help_heading = "Kafka Usage Events"
+    )]
+    kafka_body_capture_max_bytes: usize,
 
     // ==================== Request Handling ====================
     /// Custom HTTP headers to check for request IDs
@@ -975,6 +1046,7 @@ impl CliArgs {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "passthrough" => PolicyConfig::Passthrough,
+            "weighted_sticky" => PolicyConfig::WeightedSticky,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -1225,6 +1297,21 @@ impl CliArgs {
             enable_trace: self.enable_trace,
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
+        let mut kafka_usage = KafkaUsageConfig::from_env();
+        if !self.kafka_brokers.is_empty() {
+            kafka_usage.brokers = self.kafka_brokers.clone();
+        }
+        kafka_usage.topic = self.kafka_topic.clone();
+        if !self.kafka_event_header_keys.is_empty() {
+            kafka_usage.event_header_keys = self.kafka_event_header_keys.clone();
+        }
+        kafka_usage.sasl_user = self.kafka_sasl_user.clone();
+        kafka_usage.sasl_password = self.kafka_sasl_password.clone();
+        kafka_usage.sasl_mechanism = self.kafka_sasl_mechanism.clone();
+        kafka_usage.tls_enabled = self.kafka_tls_enabled;
+        kafka_usage.capture_request_body = self.kafka_capture_request_body;
+        kafka_usage.capture_response_body = self.kafka_capture_response_body;
+        kafka_usage.body_capture_max_bytes = self.kafka_body_capture_max_bytes;
 
         let mut all_urls = Vec::new();
         match &mode {
@@ -1328,6 +1415,7 @@ impl CliArgs {
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
+            .kafka_usage(kafka_usage)
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),

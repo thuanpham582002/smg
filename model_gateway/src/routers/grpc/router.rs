@@ -86,6 +86,10 @@ impl GrpcRouter {
             reasoning_parser_factory: reasoning_parser_factory.clone(),
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             multimodal,
+            usage_event_publisher: ctx.usage_event_publisher.clone(),
+            kafka_event_header_keys: ctx.router_config.kafka_usage.event_header_keys.clone(),
+            kafka_capture_response_body: ctx.router_config.kafka_usage.capture_response_body,
+            kafka_body_capture_max_bytes: ctx.router_config.kafka_usage.body_capture_max_bytes,
         });
 
         // Create regular pipeline

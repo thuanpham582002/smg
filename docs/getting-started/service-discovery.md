@@ -65,6 +65,22 @@ Matches pods that carry every listed label.
 
 ---
 
+## Public Model Names
+
+For A/B routing where clients use one public model name and backends expose different served model names, combine Kubernetes discovery with `weighted_sticky` worker metadata. Discovery still finds backend pods by selector, while the model abstraction metadata belongs on the worker registration/config:
+
+```yaml
+models:
+  - id: llama-3.1-8b-a
+    aliases: [gpt-public]
+served_model_name: llama-3.1-8b-a
+routing_weight: 80
+```
+
+Workers discovered from Kubernetes are still selected by label selector; users do not need to hardcode pod IPs. Use `--model-id-from=label:<key>` or `--model-id-from=annotation:<key>` when pod metadata carries the backend model identity, then provide `served_model_name`, `routing_weight`, and public aliases through worker registration/config.
+
+---
+
 ## PD Disaggregation Discovery
 
 For prefill-decode deployments, use separate selectors:

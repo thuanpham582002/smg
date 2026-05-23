@@ -23,6 +23,7 @@ mod random;
 mod registry;
 mod round_robin;
 pub(crate) mod utils;
+mod weighted_sticky;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
@@ -39,6 +40,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use weighted_sticky::WeightedStickyPolicy;
 
 /// Core trait for load balancing policies
 ///

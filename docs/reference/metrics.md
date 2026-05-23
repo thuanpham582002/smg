@@ -624,6 +624,52 @@ Consistent hashing policy execution branch counts for routing decisions.
 
 ---
 
+### `smg_weighted_sticky_policy_branch_total`
+
+Weighted sticky policy execution branch counts for routing decisions.
+
+| Type | Labels |
+|------|--------|
+| Counter | `branch` |
+
+Branches: `sticky`, `random_fallback`, `no_healthy_workers`
+
+---
+
+### `smg_model_rewrite_total`
+
+Model-name rewrite outcomes before forwarding requests to backend workers.
+
+| Type | Labels |
+|------|--------|
+| Counter | `public_model`, `served_model`, `result` |
+
+Results: `success`, `failure`
+
+---
+
+### `smg_model_backend_route_total`
+
+Model-aware backend routing decisions.
+
+| Type | Labels |
+|------|--------|
+| Counter | `public_model`, `selected_backend`, `served_model`, `policy` |
+
+---
+
+### `smg_data_plane_auth_total`
+
+Data-plane authentication decisions before routing.
+
+| Type | Labels |
+|------|--------|
+| Counter | `method`, `result` |
+
+Results: `allow`, `deny`
+
+---
+
 ### `smg_prefix_hash_policy_branch_total`
 
 Prefix hash policy execution branch counts for routing decisions.

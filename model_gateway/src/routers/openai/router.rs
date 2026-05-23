@@ -174,6 +174,19 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             provider_registry: &self.provider_registry,
             shared_components: &self.shared_components,
             retry_config,
+            usage_event_publisher: &self.context.usage_event_publisher,
+            kafka_event_header_keys: &self.context.router_config.kafka_usage.event_header_keys,
+            kafka_capture_request_body: self.context.router_config.kafka_usage.capture_request_body,
+            kafka_capture_response_body: self
+                .context
+                .router_config
+                .kafka_usage
+                .capture_response_body,
+            kafka_body_capture_max_bytes: self
+                .context
+                .router_config
+                .kafka_usage
+                .body_capture_max_bytes,
         };
         chat::route_chat(&deps, headers, tenant_meta, body, model_id).await
     }
@@ -189,6 +202,19 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             worker_registry: &self.worker_registry,
             provider_registry: &self.provider_registry,
             responses_components: &self.responses_components,
+            usage_event_publisher: &self.context.usage_event_publisher,
+            kafka_event_header_keys: &self.context.router_config.kafka_usage.event_header_keys,
+            kafka_capture_request_body: self.context.router_config.kafka_usage.capture_request_body,
+            kafka_capture_response_body: self
+                .context
+                .router_config
+                .kafka_usage
+                .capture_response_body,
+            kafka_body_capture_max_bytes: self
+                .context
+                .router_config
+                .kafka_usage
+                .body_capture_max_bytes,
         };
         responses_route::route_responses(&deps, headers, tenant_meta, body, model_id).await
     }

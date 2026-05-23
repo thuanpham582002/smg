@@ -28,6 +28,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    observability::usage_events::UsageEventPublisher,
     worker::{RuntimeType, Worker, WorkerLoadGuard},
 };
 
@@ -99,6 +100,10 @@ pub(crate) struct SharedComponents {
     pub configured_tool_parser: Option<String>,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    pub usage_event_publisher: Arc<dyn UsageEventPublisher>,
+    pub kafka_event_header_keys: Vec<String>,
+    pub kafka_capture_response_body: bool,
+    pub kafka_body_capture_max_bytes: usize,
 }
 
 /// Mutable processing state (evolves through pipeline stages)

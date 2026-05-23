@@ -36,6 +36,10 @@ use crate::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
+        usage_events::{
+            capture_body, publish_non_streaming_response, wrap_streaming_response, TokenInfo,
+            UsageEventContext,
+        },
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -50,12 +54,22 @@ use crate::{
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
 };
 
+struct RoutedResponse {
+    response: Response,
+    usage_event_context: Option<UsageEventContext>,
+}
+
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     retry_config: RetryConfig,
+    usage_event_publisher: Arc<dyn crate::observability::usage_events::UsageEventPublisher>,
+    kafka_event_header_keys: Vec<String>,
+    kafka_capture_request_body: bool,
+    kafka_capture_response_body: bool,
+    kafka_body_capture_max_bytes: usize,
 }
 
 impl std::fmt::Debug for Router {
@@ -65,6 +79,7 @@ impl std::fmt::Debug for Router {
             .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("retry_config", &self.retry_config)
+            .field("kafka_event_header_keys", &self.kafka_event_header_keys)
             .finish()
     }
 }
@@ -81,6 +96,11 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            usage_event_publisher: ctx.usage_event_publisher.clone(),
+            kafka_event_header_keys: ctx.router_config.kafka_usage.event_header_keys.clone(),
+            kafka_capture_request_body: ctx.router_config.kafka_usage.capture_request_body,
+            kafka_capture_response_body: ctx.router_config.kafka_usage.capture_response_body,
+            kafka_body_capture_max_bytes: ctx.router_config.kafka_usage.body_capture_max_bytes,
         })
     }
 
@@ -192,6 +212,17 @@ impl Router {
             model_id,
             policy.name(),
         );
+        Metrics::record_model_backend_route(
+            model_id,
+            available[idx].url(),
+            available[idx]
+                .metadata()
+                .spec
+                .served_model_name
+                .as_deref()
+                .unwrap_or_else(|| available[idx].model_id()),
+            policy.name(),
+        );
 
         Some(available[idx].clone())
     }
@@ -208,6 +239,14 @@ impl Router {
         let text = typed_req.extract_text_for_routing();
         let model = model_id;
         let endpoint = route_to_endpoint(route);
+        let request_body_capture = self
+            .kafka_capture_request_body
+            .then(|| {
+                serde_json::to_vec(typed_req)
+                    .ok()
+                    .and_then(|body| capture_body(&body, self.kafka_body_capture_max_bytes))
+            })
+            .flatten();
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -225,25 +264,27 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let routed = RetryExecutor::execute_item_with_retry(
             retry_config,
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers, typed_req, route, model_id, is_stream, &text, start,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
                 Metrics::record_router_upstream_response(
                     metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
+                    res.response.status().as_u16(),
+                    extract_error_code_from_response(&res.response),
                 );
 
                 res
             },
             // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_status(res.response.status()),
             // on_backoff hook
             |delay, attempt| {
                 // Layer 3 worker metrics
@@ -254,8 +295,13 @@ impl Router {
             || {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
             },
+            |routed| &routed.response,
         )
         .await;
+        let RoutedResponse {
+            response,
+            usage_event_context,
+        } = routed;
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -278,7 +324,21 @@ impl Router {
             );
         }
 
-        response
+        if let Some(ctx) = usage_event_context {
+            let ctx = ctx.with_audit_capture(
+                request_body_capture,
+                self.kafka_capture_response_body,
+                self.kafka_body_capture_max_bytes,
+            );
+            if is_stream {
+                wrap_streaming_response(response, ctx, self.usage_event_publisher.clone())
+            } else {
+                publish_non_streaming_response(response, ctx, self.usage_event_publisher.clone())
+                    .await
+            }
+        } else {
+            response
+        }
     }
 
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
@@ -289,7 +349,8 @@ impl Router {
         model_id: &str,
         is_stream: bool,
         text: &str,
-    ) -> Response {
+        start: Instant,
+    ) -> RoutedResponse {
         let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
@@ -307,12 +368,34 @@ impl Router {
                     false,
                 );
                 return if total.is_empty() {
-                    error::model_not_found(model_id)
+                    let response = error::model_not_found(model_id);
+                    RoutedResponse {
+                        response,
+                        usage_event_context: Some(UsageEventContext::unrouted(
+                            headers,
+                            &self.kafka_event_header_keys,
+                            route,
+                            model_id,
+                            is_stream,
+                            start,
+                        )),
+                    }
                 } else {
-                    error::service_unavailable(
+                    let response = error::service_unavailable(
                         "no_available_workers",
                         "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
+                    );
+                    RoutedResponse {
+                        response,
+                        usage_event_context: Some(UsageEventContext::unrouted(
+                            headers,
+                            &self.kafka_event_header_keys,
+                            route,
+                            model_id,
+                            is_stream,
+                            start,
+                        )),
+                    }
                 };
             }
         };
@@ -328,6 +411,16 @@ impl Router {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
+
+        let usage_event_context = UsageEventContext::from_request(
+            headers,
+            &self.kafka_event_header_keys,
+            route,
+            model_id,
+            worker.as_ref(),
+            is_stream,
+            start,
+        );
 
         let response = self
             .send_typed_request(
@@ -354,7 +447,10 @@ impl Router {
             );
         }
 
-        response
+        RoutedResponse {
+            response,
+            usage_event_context: Some(usage_event_context),
+        }
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -498,6 +594,24 @@ impl Router {
         // upstream worker (model_not_found, dp_aware_not_supported, no
         // available workers, build failure). Without this, pre-send failures
         // silently disappear from router_upstream_responses / router_error.
+        let publish_pre_send_error = |response: &Response, error_type: &'static str| {
+            let usage_ctx = UsageEventContext::unrouted(
+                headers,
+                &self.kafka_event_header_keys,
+                route,
+                model_id,
+                is_stream,
+                start,
+            );
+            self.usage_event_publisher.publish(usage_ctx.build_event(
+                response.status(),
+                None,
+                TokenInfo::default(),
+                None,
+                None,
+                Some(error_type),
+            ));
+        };
         let record_pre_send_error = |response: &Response| {
             let rstatus = response.status();
             Metrics::record_router_upstream_response(
@@ -537,6 +651,7 @@ impl Router {
         if all_workers.is_empty() {
             let resp = error::model_not_found(model_id);
             record_pre_send_error(&resp);
+            publish_pre_send_error(&resp, "model_not_found");
             return resp;
         }
         let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
@@ -550,6 +665,7 @@ impl Router {
                 "/v1/audio/transcriptions does not yet support DP-aware workers",
             );
             record_pre_send_error(&resp);
+            publish_pre_send_error(&resp, "dp_aware_not_supported");
             return resp;
         }
         let available: Vec<Arc<dyn Worker>> = non_dp_workers
@@ -563,6 +679,7 @@ impl Router {
                 "All workers are unavailable (circuit breaker open or unhealthy)",
             );
             record_pre_send_error(&resp);
+            publish_pre_send_error(&resp, "no_available_workers");
             return resp;
         }
 
@@ -586,6 +703,7 @@ impl Router {
                     "Policy returned no eligible worker",
                 );
                 record_pre_send_error(&resp);
+                publish_pre_send_error(&resp, "no_available_workers");
                 return resp;
             }
         };
@@ -612,9 +730,20 @@ impl Router {
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
                 record_pre_send_error(&resp);
+                publish_pre_send_error(&resp, "multipart_build_failed");
                 return resp;
             }
         };
+
+        let usage_ctx = UsageEventContext::from_request(
+            headers,
+            &self.kafka_event_header_keys,
+            route,
+            model_id,
+            worker.as_ref(),
+            is_stream,
+            start,
+        );
 
         let endpoint_url = worker.endpoint_url(route);
         let mut request_builder = self.client.post(&endpoint_url).multipart(form);
@@ -680,6 +809,14 @@ impl Router {
                     endpoint,
                     error_type_from_status(err_status),
                 );
+                self.usage_event_publisher.publish(usage_ctx.build_event(
+                    err_status,
+                    None,
+                    TokenInfo::default(),
+                    None,
+                    None,
+                    Some(error_type_from_status(err_status)),
+                ));
                 return err_resp;
             }
         };
@@ -833,7 +970,12 @@ impl Router {
             }
         }
 
-        response
+        if is_stream {
+            wrap_streaming_response(response, usage_ctx, self.usage_event_publisher.clone())
+        } else {
+            publish_non_streaming_response(response, usage_ctx, self.usage_event_publisher.clone())
+                .await
+        }
     }
 
     // Send typed request directly without conversion
@@ -1241,10 +1383,34 @@ impl RouterTrait for Router {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::to_bytes;
+    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use serde_json::json;
 
     use super::*;
-    use crate::{config::types::PolicyConfig, worker::BasicWorkerBuilder};
+    use crate::config::types::PolicyConfig;
+    use crate::observability::usage_events::{UsageEvent, UsageEventPublisher};
+    use crate::worker::BasicWorkerBuilder;
+
+    #[derive(Clone, Default)]
+    struct CapturingUsageEventPublisher {
+        events: Arc<Mutex<Vec<UsageEvent>>>,
+    }
+
+    impl CapturingUsageEventPublisher {
+        fn events(&self) -> Vec<UsageEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl UsageEventPublisher for CapturingUsageEventPublisher {
+        fn publish(&self, event: UsageEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -1275,6 +1441,13 @@ mod tests {
             policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(
+                crate::observability::usage_events::NoopUsageEventPublisher,
+            ),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
         }
     }
 
@@ -1317,5 +1490,347 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_route_rewrites_model_after_backend_selection() {
+        let captured_body = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let captured_for_handler = Arc::clone(&captured_body);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let captured_for_handler = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured_for_handler.lock().unwrap() = Some(body);
+                    Json(json!({"ok": true}))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::WeightedSticky));
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("llama-real").with_alias("gpt-public"))
+            .served_model_name("llama-real")
+            .routing_weight(100)
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(
+                crate::observability::usage_events::NoopUsageEventPublisher,
+            ),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "gpt-public", "text": "hello"})).unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", "gpt-public")
+            .await;
+
+        assert!(response.status().is_success());
+        let body = captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(body["model"], "llama-real");
+        assert_eq!(body["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn test_usage_event_non_streaming_success() {
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "model": "llama-real",
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 7,
+                        "total_tokens": 12,
+                        "prompt_tokens_details": {"cached_tokens": 2}
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("gpt-public"))
+            .served_model_name("llama-real")
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let publisher = CapturingUsageEventPublisher::default();
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(publisher.clone()),
+            kafka_event_header_keys: vec![
+                "x-project-id".to_string(),
+                "x-model-name".to_string(),
+                "x-model-id".to_string(),
+            ],
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-success"));
+        headers.insert("x-project-id", HeaderValue::from_static("project-1"));
+        headers.insert("x-model-name", HeaderValue::from_static("catalog-model"));
+        headers.insert("x-model-id", HeaderValue::from_static("model-uuid"));
+        headers.insert("authorization", HeaderValue::from_static("bearer secret"));
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "gpt-public", "text": "hello"})).unwrap();
+
+        let response = router
+            .route_typed_request(Some(&headers), &request, "/generate", "gpt-public")
+            .await;
+
+        assert!(response.status().is_success());
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.request_id, "req-success");
+        assert_eq!(event.original_model, "gpt-public");
+        assert_eq!(event.request_model, "llama-real");
+        assert_eq!(event.response_model, "llama-real");
+        assert!(event.success);
+        assert_eq!(event.tokens.input_tokens, 5);
+        assert_eq!(event.tokens.output_tokens, 7);
+        assert_eq!(event.tokens.total_tokens, 12);
+        assert_eq!(event.tokens.cached_tokens, Some(2));
+        assert_eq!(
+            event.headers.get("x-project-id").map(String::as_str),
+            Some("project-1")
+        );
+        assert!(!event.headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_usage_event_backend_error() {
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "bad request"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("gpt-public"))
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let publisher = CapturingUsageEventPublisher::default();
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(publisher.clone()),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "gpt-public", "text": "hello"})).unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", "gpt-public")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+        assert_eq!(events[0].tokens.total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn test_usage_event_no_worker_failure() {
+        let publisher = CapturingUsageEventPublisher::default();
+        let router = Router {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(publisher.clone()),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "missing-model", "text": "hello"})).unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", "missing-model")
+            .await;
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+        assert_eq!(events[0].original_model, "missing-model");
+        assert_eq!(events[0].backend_name, "");
+    }
+
+    #[tokio::test]
+    async fn test_usage_event_streaming_success_with_final_usage() {
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|| async {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"model\":\"llama-real\",\"choices\":[{\"text\":\"hello\"}]}\n\n\
+                     data: {\"model\":\"llama-real\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("gpt-public"))
+            .served_model_name("llama-real")
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let publisher = CapturingUsageEventPublisher::default();
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(publisher.clone()),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "gpt-public", "text": "hello", "stream": true}))
+                .unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", "gpt-public")
+            .await;
+        assert!(response.status().is_success());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("[DONE]"));
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert!(event.stream);
+        assert!(event.success);
+        assert_eq!(event.response_model, "llama-real");
+        assert_eq!(event.tokens.input_tokens, 2);
+        assert_eq!(event.tokens.output_tokens, 3);
+        assert_eq!(event.tokens.total_tokens, 5);
+        assert!(event.time_to_first_token_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_usage_event_streaming_success_without_usage_keeps_zero_tokens() {
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|| async {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"model\":\"llama-real\",\"choices\":[{\"text\":\"hello\"}]}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let worker = BasicWorkerBuilder::new(backend_url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("gpt-public"))
+            .health_config(no_health_check())
+            .build();
+        worker_registry.register_or_replace(Arc::new(worker));
+
+        let publisher = CapturingUsageEventPublisher::default();
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            usage_event_publisher: Arc::new(publisher.clone()),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_request_body: false,
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(json!({"model": "gpt-public", "text": "hello", "stream": true}))
+                .unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", "gpt-public")
+            .await;
+        assert!(response.status().is_success());
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].stream);
+        assert_eq!(events[0].tokens.input_tokens, 0);
+        assert_eq!(events[0].tokens.output_tokens, 0);
+        assert_eq!(events[0].tokens.total_tokens, 0);
+        assert_eq!(events[0].response_model, "llama-real");
     }
 }

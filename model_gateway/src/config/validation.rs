@@ -240,6 +240,7 @@ impl ConfigValidator {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::Passthrough
+            | PolicyConfig::WeightedSticky
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {

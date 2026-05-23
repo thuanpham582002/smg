@@ -21,7 +21,7 @@ else
     $(info sccache not found. Install it for faster builds: cargo install sccache)
 endif
 
-.PHONY: help build test clean docs check fmt opencv-deps dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
+.PHONY: help build test clean docs check fmt opencv-deps docker-build-h200 dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
         generate-openapi generate-python-types generate-java-types generate-clients \
         show-version bump-version check-versions
@@ -36,6 +36,9 @@ help: ## Show this help message
 build: ## Build the project in release mode
 	@echo "Building Shepherd Model Gateway..."
 	@cargo build --release
+
+docker-build-h200: ## Build an H200 engine Docker image (set SMG_REPO and SMG_COMMIT)
+	@bash scripts/build_h200_image.sh
 
 test: ## Run all tests
 	@echo "Running tests..."

@@ -152,10 +152,14 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_endpoint(health_endpoint)
                     .bootstrap_port(config.bootstrap_port)
                     .priority(config.priority)
-                    .cost(config.cost);
+                    .cost(config.cost)
+                    .routing_weight(config.routing_weight);
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
+                }
+                if let Some(ref served_model_name) = config.served_model_name {
+                    builder = builder.served_model_name(served_model_name);
                 }
                 if let Some(ref key) = config.api_key {
                     builder = builder.api_key(key.clone());

@@ -74,7 +74,7 @@ Controls how requests are distributed across workers.
 |--------|------------|
 | Environment | - |
 | Default | `cache_aware` |
-| Values | `random`, `round_robin`, `cache_aware`, `power_of_two`, `prefix_hash`, `consistent_hashing`, `bucket`, `manual` |
+| Values | `random`, `round_robin`, `weighted_sticky`, `cache_aware`, `power_of_two`, `prefix_hash`, `consistent_hashing`, `bucket`, `manual` |
 
 **Policy Comparison**:
 
@@ -82,6 +82,7 @@ Controls how requests are distributed across workers.
 |--------|----------|----------|--------------|
 | `random` | Simple deployments | Poor | Fair |
 | `round_robin` | Uniform workloads | Poor | Good |
+| `weighted_sticky` | Weighted A/B routing with sticky keys | Fair | Good |
 | `power_of_two` | Variable workloads | Poor | Excellent |
 | `cache_aware` | LLM inference | Excellent | Good |
 | `prefix_hash` | Consistent routing by prefix | Good | Good |
@@ -90,6 +91,39 @@ Controls how requests are distributed across workers.
 | `manual` | Sticky sessions with LRU eviction | Good | Manual |
 
 **Recommendation**: Use `cache_aware` for LLM workloads to maximize KV cache hit rates.
+
+### Weighted Sticky Policy
+
+`weighted_sticky` routes by `routing_weight` while preserving affinity when a stable key is present.
+
+- Sticky key priority: `X-SMG-Routing-Key`, `X-Session-ID`, `X-User-ID`, then `Cookie`.
+- Requests with a sticky key use stable weighted hashing.
+- Requests without a sticky key use weighted random selection.
+- Unhealthy workers are excluded from both paths.
+
+For model-name abstraction, register backend workers with a real model `id`, the public model name as an alias, and `served_model_name` set to the backend's real served name:
+
+```yaml
+workers:
+  - url: http://vllm-a:8000
+    routing_weight: 80
+    served_model_name: llama-3.1-8b-a
+    models:
+      - id: llama-3.1-8b-a
+        aliases: [gpt-public]
+  - url: http://vllm-b:8000
+    routing_weight: 20
+    served_model_name: llama-3.1-8b-b
+    models:
+      - id: llama-3.1-8b-b
+        aliases: [gpt-public]
+policy:
+  type: weighted_sticky
+```
+
+Clients send `{"model":"gpt-public"}`. SMG selects a backend, rewrites only the top-level request `model` field to that worker's `served_model_name`, and forwards the request.
+
+Data-plane authentication can run before routing via the standard API-key middleware or WASM `OnRequest` middleware. WASM `OnRequest` modules can reject unauthorized requests or add routing headers such as `X-SMG-Routing-Key` before `weighted_sticky` runs.
 
 ### Cache-Aware Policy Options
 

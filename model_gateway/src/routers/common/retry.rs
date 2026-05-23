@@ -112,10 +112,10 @@ impl RetryExecutor {
     /// ```
     pub async fn execute_response_with_retry<Op, Fut, ShouldRetry, OnBackoff, OnExhausted>(
         config: &RetryConfig,
-        mut operation: Op,
+        operation: Op,
         should_retry: ShouldRetry,
         on_backoff: OnBackoff,
-        mut on_exhausted: OnExhausted,
+        on_exhausted: OnExhausted,
     ) -> Response
     where
         Op: FnMut(u32) -> Fut,
@@ -124,20 +124,55 @@ impl RetryExecutor {
         OnBackoff: Fn(Duration, u32),
         OnExhausted: FnMut(),
     {
+        Self::execute_item_with_retry(
+            config,
+            operation,
+            should_retry,
+            on_backoff,
+            on_exhausted,
+            |response| response,
+        )
+        .await
+    }
+
+    pub async fn execute_item_with_retry<
+        Op,
+        Fut,
+        T,
+        ShouldRetry,
+        OnBackoff,
+        OnExhausted,
+        AsResponse,
+    >(
+        config: &RetryConfig,
+        mut operation: Op,
+        should_retry: ShouldRetry,
+        on_backoff: OnBackoff,
+        mut on_exhausted: OnExhausted,
+        as_response: AsResponse,
+    ) -> T
+    where
+        Op: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = T>,
+        ShouldRetry: Fn(&T, u32) -> bool,
+        OnBackoff: Fn(Duration, u32),
+        OnExhausted: FnMut(),
+        AsResponse: Fn(&T) -> &Response,
+    {
         let max = config.max_retries.max(1);
 
         let mut attempt: u32 = 0;
         loop {
-            let response = operation(attempt).await;
+            let item = operation(attempt).await;
             let is_last = attempt + 1 >= max;
 
-            if !should_retry(&response, attempt) {
-                return response;
+            if !should_retry(&item, attempt) {
+                return item;
             }
 
             if is_last {
                 on_exhausted();
-                return response;
+                return item;
             }
 
             let next_attempt = attempt + 1;
@@ -145,6 +180,7 @@ impl RetryExecutor {
             debug!(
                 attempt = attempt,
                 next_attempt = next_attempt,
+                status_code = as_response(&item).status().as_u16(),
                 delay_ms = delay.as_millis() as u64,
                 "Retry backoff"
             );

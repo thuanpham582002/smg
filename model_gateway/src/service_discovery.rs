@@ -1314,6 +1314,9 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            usage_event_publisher: Arc::new(
+                crate::observability::usage_events::NoopUsageEventPublisher,
+            ),
             kv_event_monitor: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

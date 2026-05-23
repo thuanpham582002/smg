@@ -701,15 +701,34 @@ impl WorkerMetadata {
         if let Some(rank) = self.spec.dp_rank {
             if let Some(map) = req.as_object_mut() {
                 map.insert("data_parallel_rank".to_string(), serde_json::json!(rank));
-                Ok(req)
             } else {
-                Err(WorkerError::InvalidConfiguration {
+                return Err(WorkerError::InvalidConfiguration {
                     message: "Request must be a JSON object for DP-aware routing".to_string(),
-                })
+                });
             }
-        } else {
-            Ok(req)
         }
+
+        if let Some(served_model_name) = &self.spec.served_model_name {
+            if let Some(map) = req.as_object_mut() {
+                let public_model = map
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                map.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(served_model_name.clone()),
+                );
+                Metrics::record_model_rewrite(&public_model, served_model_name, "success");
+            } else {
+                Metrics::record_model_rewrite("", served_model_name, "failure");
+                return Err(WorkerError::InvalidConfiguration {
+                    message: "Request must be a JSON object for model rewrite".to_string(),
+                });
+            }
+        }
+
+        Ok(req)
     }
 
     // ── Routing priorities / model lookup ───────────────────────────
@@ -1931,6 +1950,42 @@ mod tests {
         assert_eq!(prepared_req["prompt"], "Hello");
         assert_eq!(prepared_req["max_tokens"], 100);
         assert_eq!(prepared_req["data_parallel_rank"], 3);
+    }
+
+    #[test]
+    fn test_served_model_name_rewrites_top_level_model() {
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .served_model_name("llama-3.1-8b-real")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        let original_req = serde_json::json!({
+            "model": "gpt-public",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": {"model": "do-not-touch"}
+        });
+
+        let prepared_req = worker.prepare_request(original_req).unwrap();
+
+        assert_eq!(prepared_req["model"], "llama-3.1-8b-real");
+        assert_eq!(prepared_req["messages"][0]["content"], "Hello");
+        assert_eq!(prepared_req["metadata"]["model"], "do-not-touch");
+    }
+
+    #[test]
+    fn test_prepare_request_applies_dp_rank_and_model_rewrite() {
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .dp_config(2, 4)
+            .served_model_name("served-model")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        let prepared_req = worker
+            .prepare_request(serde_json::json!({"model": "public-model"}))
+            .unwrap();
+
+        assert_eq!(prepared_req["model"], "served-model");
+        assert_eq!(prepared_req["data_parallel_rank"], 2);
     }
 
     #[test]

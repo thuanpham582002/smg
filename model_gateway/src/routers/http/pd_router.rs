@@ -30,6 +30,10 @@ use crate::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
+        usage_events::{
+            publish_non_streaming_response, wrap_streaming_response, TokenInfo, UsageEventContext,
+            UsageEventPublisher,
+        },
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -45,13 +49,16 @@ use crate::{
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    usage_event_publisher: Arc<dyn UsageEventPublisher>,
+    kafka_event_header_keys: Vec<String>,
+    kafka_capture_response_body: bool,
+    kafka_body_capture_max_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -168,6 +175,10 @@ impl PDRouter {
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            usage_event_publisher: ctx.usage_event_publisher.clone(),
+            kafka_event_header_keys: ctx.router_config.kafka_usage.event_header_keys.clone(),
+            kafka_capture_response_body: ctx.router_config.kafka_usage.capture_response_body,
+            kafka_body_capture_max_bytes: ctx.router_config.kafka_usage.body_capture_max_bytes,
         })
     }
 
@@ -182,6 +193,55 @@ impl PDRouter {
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
+    }
+
+    fn usage_context(
+        &self,
+        headers: Option<&HeaderMap>,
+        context: &PDRequestContext<'_>,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+        started_at: Instant,
+    ) -> UsageEventContext {
+        let served_model_name = decode
+            .metadata()
+            .spec
+            .served_model_name
+            .as_deref()
+            .unwrap_or("");
+        let request_model = if served_model_name.is_empty() {
+            context.model_id
+        } else {
+            served_model_name
+        };
+        let selected_pool = format!("prefill={},decode={}", prefill.url(), decode.url());
+
+        UsageEventContext::from_backend(
+            headers,
+            &self.kafka_event_header_keys,
+            context.route,
+            context.model_id,
+            request_model,
+            decode.url(),
+            &selected_pool,
+            served_model_name,
+            context.is_stream,
+            started_at,
+        )
+        .with_audit_capture(
+            None,
+            self.kafka_capture_response_body,
+            self.kafka_body_capture_max_bytes,
+        )
+    }
+
+    async fn publish_response(&self, response: Response, usage_ctx: UsageEventContext) -> Response {
+        if usage_ctx.stream {
+            wrap_streaming_response(response, usage_ctx, self.usage_event_publisher.clone())
+        } else {
+            publish_non_streaming_response(response, usage_ctx, self.usage_event_publisher.clone())
+                .await
+        }
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -330,7 +390,24 @@ impl PDRouter {
                         {
                             Ok(pair) => pair,
                             Err(e) => {
-                                return Self::handle_server_selection_error(e);
+                                let response = Self::handle_server_selection_error(e);
+                                let usage_ctx = UsageEventContext::unrouted(
+                                    context.headers.as_ref(),
+                                    &self.kafka_event_header_keys,
+                                    context.route,
+                                    context.model_id,
+                                    context.is_stream,
+                                    start_time,
+                                );
+                                self.usage_event_publisher.publish(usage_ctx.build_event(
+                                    response.status(),
+                                    None,
+                                    TokenInfo::default(),
+                                    None,
+                                    None,
+                                    Some(error_type_from_status(response.status())),
+                                ));
+                                return response;
                             }
                         };
 
@@ -421,7 +498,7 @@ impl PDRouter {
                                 headers,
                                 prefill_json_request,
                                 decode_json_request,
-                                context,
+                                context.clone(),
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
                             )
@@ -446,7 +523,14 @@ impl PDRouter {
                             );
                         }
 
-                        response
+                        let usage_ctx = self.usage_context(
+                            context.headers.as_ref(),
+                            &context,
+                            prefill.as_ref(),
+                            decode.as_ref(),
+                            start_time,
+                        );
+                        self.publish_response(response, usage_ctx).await
                     }
                 }
             },
@@ -1012,6 +1096,22 @@ impl PDRouter {
         AttachedBody::wrap_response(response, load_guards)
     }
 
+    fn prefill_decode_worker_counts(&self) -> (usize, usize) {
+        let prefill_workers = self
+            .worker_registry
+            .get_prefill_workers()
+            .iter()
+            .filter(|worker| worker.is_available())
+            .count();
+        let decode_workers = self
+            .worker_registry
+            .get_decode_workers()
+            .iter()
+            .filter(|worker| worker.is_available())
+            .count();
+        (prefill_workers, decode_workers)
+    }
+
     // Helper to process non-streaming decode response with logprob merging
     async fn process_non_streaming_response(
         &self,
@@ -1229,6 +1329,16 @@ impl PDRouter {
 
         // Re-serialize via the shared encoder (reuses its buffer across chunks).
         encoder.encode_data(&decode_json).map_err(|_| ())
+    }
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (prefill_workers_count, decode_workers_count) = self.prefill_decode_worker_counts();
+        f.debug_struct("PDRouter")
+            .field("prefill_workers_count", &prefill_workers_count)
+            .field("decode_workers_count", &decode_workers_count)
+            .finish()
     }
 }
 
@@ -1489,6 +1599,12 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            usage_event_publisher: Arc::new(
+                crate::observability::usage_events::NoopUsageEventPublisher,
+            ),
+            kafka_event_header_keys: Vec::new(),
+            kafka_capture_response_body: false,
+            kafka_body_capture_max_bytes: 8192,
         }
     }
 
