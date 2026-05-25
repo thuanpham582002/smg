@@ -6,10 +6,10 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, validate_stop, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_false, is_false, is_true, validate_stop, ChatLogProbs,
+        ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat,
+        StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
+        ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -276,7 +276,7 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
@@ -284,7 +284,7 @@ pub struct ChatCompletionRequest {
     pub ignore_eos: bool,
 
     /// Continue generating from final assistant message
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continue_final_message: bool,
 
     /// Skip special tokens during detokenization
@@ -298,18 +298,18 @@ pub struct ChatCompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub separate_reasoning: bool,
 
     /// Stream reasoning tokens during generation
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// Random seed for sampling for deterministic outputs

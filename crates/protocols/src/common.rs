@@ -19,6 +19,21 @@ pub fn default_true() -> bool {
     true
 }
 
+/// `skip_serializing_if` predicate: skip when the bool is `false`.
+/// Use on fields that default to `false` and should not be wire-emitted at default,
+/// e.g. SGLang-only flags forwarded over HTTP to vLLM backends that strict-reject
+/// unknown parameters.
+pub fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// `skip_serializing_if` predicate: skip when the bool is `true`.
+/// Use on fields whose default is `true` (via `default_true`) so the default value
+/// stays off the wire and unknown to non-SGLang backends.
+pub fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
 ///
 /// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`

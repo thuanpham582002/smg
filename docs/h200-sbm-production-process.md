@@ -193,14 +193,87 @@ schema_migrations version: 28
 mc_usage_log.cached_tokens: exists
 ```
 
-## Remaining Verification
+## Multi-backend Verification (2026-05-26)
 
-These steps were not completed before interruption and should be run before calling the production goal complete:
+Resumed the loop with two live backends (the previous "validated candidates" had been torn down):
 
-1. Register both workers against the new `weighted_sticky` pod.
-2. Verify `/readiness` returns 200 after workers are routable.
-3. Send a non-sticky request batch with `model=sbm-public` and count Kafka `backend_name` distribution.
-4. Send repeated requests with the same `X-SMG-Routing-Key` and verify backend stickiness in Kafka events.
-5. Confirm request bodies sent to clients keep `model=sbm-public` while backend usage events show the selected served model.
-6. Confirm new usage rows land in `mc_usage_log` with stable model-registry identity headers.
-7. Scrape `/metrics` and confirm routing/rewrite/Kafka counters increment.
+```text
+gpt-oss-120b   weight=80  http://gpt-oss-pd-lm-mooncake-frontend.kimi-mooncake-bench.svc.cluster.local:8000
+Qwen3.5-9B     weight=20  http://qwen3-9b.qwen3-serve.svc.cluster.local:8000
+```
+
+### Blocker found and fixed
+
+The first chat completion through `model=sbm-public` returned HTTP 400 from the backend:
+
+```text
+Validation: Unsupported parameter(s): no_stop_trim, return_hidden_states,
+continue_final_message, separate_reasoning, stream_reasoning
+```
+
+Root cause: `ChatCompletionRequest` in `crates/protocols/src/chat.rs` re-serialized five
+SGLang-only fields at their default values, and vLLM strict-rejects unknown parameters.
+
+Fix: add `skip_serializing_if` to those five fields (and helpers `is_false` / `is_true` in
+`crates/protocols/src/common.rs`). SGLang behavior is unchanged — SGLang already treats a
+missing field and the default value identically.
+
+Rebuilt image:
+
+```text
+10.29.252.145:5000/smg-sbm-test:20260526-20260526-035237-skip-sglang-fields
+```
+
+### Acceptance evidence
+
+```text
+GET  /readiness  ->  HTTP 200  {"status":"ready","healthy_workers":2,"total_workers":2}
+POST /v1/chat/completions  with body model="sbm-public"  ->  HTTP 200
+```
+
+Traffic split (20 requests, no sticky header):
+
+```text
+gpt-oss-120b: 12   (60%)
+Qwen3.5-9B:    8   (40%)
+```
+
+Sticky routing (3 calls per session id, 10 distinct sessions):
+
+```text
+s1..s8, s10 -> always gpt-oss-120b (3/3 each)
+s9          -> always Qwen3.5-9B   (3/3)
+```
+
+Each session always landed on the same backend across repeated calls, and at least one
+session routed to the minority-weight backend.
+
+Kafka events on `ai-gateway-events` (sample request_id `019e60fd-30a0-7990-9643-6cd9ad9e8a9e`):
+
+```text
+original_model:      sbm-public                  (client-sent alias)
+request_model:       Qwen3.5-9B                  (rewritten served_model_name)
+response_model:      Qwen3.5-9B
+backend:             SMG
+selected_pool:       http://qwen3-9b.qwen3-serve.svc.cluster.local:8000
+model_name_override: Qwen3.5-9B
+tokens.input_tokens: 11
+tokens.output_tokens: 1
+request_body:        present (no_stop_trim et al. absent — fix confirmed on the wire)
+response_body:       present
+```
+
+Both backends produced equivalent events with their own `model_name_override` and pool URL.
+
+## Gaps still open
+
+These are not blockers for the routing/rewrite/Kafka proof above but should be tracked:
+
+- Model-registry accounting headers (`x-project-id`, `x-user-id`, `x-model-id`, `x-model-name`,
+  `x-ai-eg-model`, `x-input-price`, `x-output-price`, `x-is-free`) were not exercised in the
+  multi-backend batch. The single-backend run earlier this week did consume into `mc_usage_log`;
+  the multi-backend variant still needs that loop closed end-to-end against the new image.
+- `/metrics` scraping for routing / rewrite / Kafka counters not collected this round.
+- The doc above lists `Worker Registration` against the K8s service — only safe once the pod
+  is ready. During rollouts of the `weighted_sticky` deployment, register directly against the
+  new pod IP (port-forward or pod exec) while the old pod still owns the service endpoint.
