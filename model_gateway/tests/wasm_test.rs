@@ -209,6 +209,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         app_state,
         smg::middleware::AuthConfig::new(None),
         None, // No control plane auth for tests
+        None, // No ext-auth for tests
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins

@@ -791,6 +791,32 @@ struct CliArgs {
     )]
     disable_audit_logging: bool,
 
+    // ==================== External Authorization (data plane) ====================
+    /// URL of the external authorization endpoint. When set, every protected
+    /// inference request is gated by a POST to this URL (Envoy ext-authz style).
+    /// Example: http://mr-model-registry-service.demo-project.svc.cluster.local:8080/ext-auth
+    #[arg(long, env = "EXT_AUTH_URL", help_heading = "External Authorization")]
+    ext_auth_url: Option<String>,
+
+    /// Per-call timeout for the ext-auth probe, in milliseconds. Default: 500.
+    #[arg(
+        long,
+        env = "EXT_AUTH_TIMEOUT_MS",
+        default_value_t = 500,
+        help_heading = "External Authorization"
+    )]
+    ext_auth_timeout_ms: u64,
+
+    /// When true, a transport/IO failure calling the ext-auth endpoint lets the
+    /// request through (fail-open). Default false — transport errors return 502.
+    #[arg(
+        long,
+        env = "EXT_AUTH_FAIL_OPEN_ON_TRANSPORT_ERROR",
+        default_value_t = false,
+        help_heading = "External Authorization"
+    )]
+    ext_auth_fail_open_on_transport_error: bool,
+
     // ==================== Mesh Server ====================
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
@@ -1547,6 +1573,13 @@ impl CliArgs {
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
+            ext_auth: self.ext_auth_url.as_ref().map(|url| {
+                smg::middleware::ExtAuthConfig::new(Some(url.clone()))
+                    .with_timeout_ms(self.ext_auth_timeout_ms)
+                    .with_fail_open_on_transport_error(
+                        self.ext_auth_fail_open_on_transport_error,
+                    )
+            }),
             mesh_server_config,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server.clone(),

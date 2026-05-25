@@ -277,3 +277,74 @@ These are not blockers for the routing/rewrite/Kafka proof above but should be t
 - The doc above lists `Worker Registration` against the K8s service — only safe once the pod
   is ready. During rollouts of the `weighted_sticky` deployment, register directly against the
   new pod IP (port-forward or pod exec) while the old pod still owns the service endpoint.
+
+## External Authorization (ext-auth) middleware
+
+SMG can call a remote ext-auth endpoint (e.g. Model Registry's `POST /ext-auth`) on every
+protected inference request, matching the Envoy ext-authz contract previously implemented by
+the AI Gateway. The middleware lives in `model_gateway/src/middleware/ext_auth.rs` and is
+applied to `protected_routes` only (chat, completions, responses, embeddings, rerank, tokenize,
+realtime REST). It is **off by default**; enable it by setting `--ext-auth-url` or the
+`EXT_AUTH_URL` env var.
+
+### Configuration
+
+CLI flags (all also accept the matching env var):
+
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--ext-auth-url` | `EXT_AUTH_URL` | unset | Fully-qualified ext-auth URL. Unset disables the middleware. |
+| `--ext-auth-timeout-ms` | `EXT_AUTH_TIMEOUT_MS` | `500` | Per-call timeout on the ext-auth probe. |
+| `--ext-auth-fail-open-on-transport-error` | `EXT_AUTH_FAIL_OPEN_ON_TRANSPORT_ERROR` | `false` | When `true`, transport/IO failures contacting ext-auth let the request through. When `false`, transport errors return `502`. |
+
+The middleware forwards these inbound request headers to the ext-auth endpoint:
+
+```
+authorization, x-api-key, x-project-id, x-user-id,
+x-ai-eg-model, x-region-id, region-id
+```
+
+On a non-2xx ext-auth response, SMG returns that status verbatim (with the upstream body) to
+the client; the worker is not contacted.
+
+On a 2xx ext-auth response, the following headers are copied from the ext-auth response into
+the request that proceeds to the worker (Envoy ext-authz "additional headers" pattern), so
+downstream Kafka usage events carry the resolved identity:
+
+```
+x-project-id, x-model-id, x-api-key-id, x-input-price, x-output-price,
+x-model-name, x-ai-eg-model, x-ratelimit-remaining, x-credit-remaining, x-user-id
+```
+
+### Deployment example
+
+To gate the H200 `sbm-smoke` deployment against Model Registry:
+
+```bash
+kubectl --context kubernetes-admin@kubernetes -n sbm-smoke set env deploy/sbm-smoke \
+  EXT_AUTH_URL=http://mr-model-registry-service.demo-project.svc.cluster.local:8080/ext-auth \
+  EXT_AUTH_TIMEOUT_MS=500
+```
+
+(or add the env entries to the Deployment spec). The pod must be running an image that
+contains the ext-auth middleware (commit landing this section forward).
+
+### Acceptance check
+
+With the env var set and a chat completion call carrying valid identity headers:
+
+```bash
+curl -sS -X POST http://sbm-smoke.sbm-smoke.svc.cluster.local:30000/v1/chat/completions \
+  -H 'authorization: Bearer <api-key>' \
+  -H 'x-project-id: <project-uuid>' \
+  -H 'x-ai-eg-model: sbm-public' \
+  -H 'content-type: application/json' \
+  -d '{"model":"sbm-public","messages":[{"role":"user","content":"hi"}],"max_tokens":4}'
+```
+
+Expected:
+
+- If MR has the project + model alias seeded → HTTP 200, response model = backend served name,
+  Kafka event contains the resolved `x-project-id` / `x-model-id` / `x-model-name`.
+- If MR is missing the alias → SMG returns the MR `/ext-auth` 4xx verbatim (e.g.
+  `HTTP 404 {"error":"model catalog: model not found"}`), worker is not contacted.

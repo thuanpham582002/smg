@@ -704,6 +704,10 @@ pub struct ServerConfig {
     pub shutdown_grace_period_secs: u64,
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
+    /// External authorization (data-plane) configuration. When `Some(_)` and
+    /// its `url` is set, every protected inference request is gated by a POST
+    /// to the configured ext-auth endpoint.
+    pub ext_auth: Option<middleware::ExtAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
@@ -745,6 +749,7 @@ pub fn build_app(
     app_state: Arc<AppState>,
     auth_config: AuthConfig,
     control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
+    ext_auth_state: Option<middleware::ExtAuthState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -837,6 +842,15 @@ pub fn build_app(
         app_state.clone(),
         middleware::wasm_middleware,
     ));
+
+    let apply_ext_auth = |router: Router<Arc<AppState>>| match ext_auth_state.as_ref() {
+        Some(state) => router.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::ext_auth_middleware,
+        )),
+        None => router,
+    };
+    let protected_routes = apply_ext_auth(protected_routes);
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
@@ -1348,10 +1362,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    let ext_auth_state = config
+        .ext_auth
+        .as_ref()
+        .filter(|cfg| cfg.is_enabled())
+        .and_then(|cfg| middleware::ExtAuthState::try_init(cfg.clone()));
+    if let Some(cfg) = config.ext_auth.as_ref() {
+        if let Some(url) = cfg.url.as_deref() {
+            info!(
+                ext_auth_url = url,
+                timeout_ms = cfg.timeout_ms,
+                fail_open = cfg.fail_open_on_transport_error,
+                "ext-auth middleware enabled"
+            );
+        }
+    }
+
     let app = build_app(
         app_state,
         auth_config,
         control_plane_auth_state,
+        ext_auth_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),

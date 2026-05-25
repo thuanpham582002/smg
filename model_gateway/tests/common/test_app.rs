@@ -130,6 +130,7 @@ pub fn create_test_app(
         app_state,
         auth_config,
         None, // No control plane auth for tests
+        None, // No ext-auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
@@ -193,6 +194,7 @@ pub fn create_test_app_with_context(
         app_state,
         auth_config,
         None, // No control plane auth for tests
+        None, // No ext-auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),

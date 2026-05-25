@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod concurrency;
+pub mod ext_auth;
 pub mod logging;
 pub mod metrics;
 pub mod request_id;
@@ -16,6 +17,7 @@ pub mod token_bucket;
 pub mod wasm;
 
 pub use auth::{auth_middleware, AuthConfig};
+pub use ext_auth::{ext_auth_middleware, ExtAuthConfig, ExtAuthState};
 pub use concurrency::{
     concurrency_limit_middleware, ConcurrencyLimiter, QueueProcessor, QueuedRequest, TokenGuardBody,
 };
