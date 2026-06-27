@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(false)
         .build_client(false)
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/common.proto"], &["proto"])?;
+        .compile_protos(&["proto/common.proto"], &["proto", "/usr/include"])?;
 
     // Pass 2: compile engine protos, referencing common types via extern_path
     tonic_prost_build::configure()
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/mlx_engine.proto",
                 "proto/tokenspeed_scheduler.proto",
             ],
-            &["proto"],
+            &["proto", "/usr/include"],
         )?;
 
     Ok(())

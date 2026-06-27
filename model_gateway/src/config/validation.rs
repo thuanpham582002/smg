@@ -26,6 +26,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
         Self::validate_storage_context_headers(config)?;
+        Self::validate_model_selector_header(config)?;
         Self::validate_tenant_resolution(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -91,6 +92,25 @@ impl ConfigValidator {
                 });
             }
         }
+
+        Ok(())
+    }
+
+    fn validate_model_selector_header(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(header_name) = config.model_selector_header.as_deref() else {
+            return Ok(());
+        };
+
+        let header_name = header_name.trim();
+        if header_name.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "model_selector_header must not be empty".to_string(),
+            });
+        }
+
+        HeaderName::try_from(header_name).map_err(|e| ConfigError::ValidationFailed {
+            reason: format!("model_selector_header must be a valid HTTP header name: {e}"),
+        })?;
 
         Ok(())
     }

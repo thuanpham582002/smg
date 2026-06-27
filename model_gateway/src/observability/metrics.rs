@@ -407,6 +407,27 @@ pub(crate) fn init_metrics() {
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
 
+    // OTel GenAI-semconv aliases (dual-emitted beside the smg_router_* signals
+    // above). These let dashboards written against the Envoy AI Gateway's
+    // gen_ai_* series (token-usage dashboard) work unchanged when traffic routes
+    // through SMG. Additive only — the smg_* metrics remain authoritative.
+    describe_histogram!(
+        "gen_ai_client_token_usage",
+        "Tokens per request by gen_ai_request_model, gen_ai_token_type (OTel GenAI semconv; histogram _sum = total tokens)"
+    );
+    describe_histogram!(
+        "gen_ai_server_request_duration",
+        "Server request duration in seconds by gen_ai_request_model, gen_ai_operation_name (OTel GenAI semconv)"
+    );
+    describe_histogram!(
+        "gen_ai_server_time_to_first_token",
+        "Time to first token in seconds by gen_ai_request_model (OTel GenAI semconv)"
+    );
+    describe_histogram!(
+        "gen_ai_server_time_per_output_token",
+        "Time per output token in seconds by gen_ai_request_model (OTel GenAI semconv)"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -449,14 +470,41 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
-    PrometheusBuilder::new()
+    // The OTel GenAI-semconv aliases (dual-emitted for dashboard compatibility)
+    // do NOT end in `duration_seconds`/`ttft_seconds`/`tpot_seconds`, so without
+    // explicit buckets the exporter renders them as SUMMARIES (quantile lines)
+    // and the token-usage dashboard's histogram_quantile(... _bucket ...) queries
+    // return nothing. Register the same duration buckets by exact name. The
+    // gen_ai_client_token_usage histogram is a token COUNT, not seconds, so it
+    // gets count-scale buckets.
+    let genai_dur_matchers = [
+        Matcher::Full(String::from("gen_ai_server_request_duration")),
+        Matcher::Full(String::from("gen_ai_server_time_to_first_token")),
+        Matcher::Full(String::from("gen_ai_server_time_per_output_token")),
+    ];
+    let genai_token_matcher = Matcher::Full(String::from("gen_ai_client_token_usage"));
+    let token_bucket: Vec<f64> = vec![
+        1.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0,
+        32768.0, 65536.0, 131072.0,
+    ];
+
+    let mut builder = PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .set_buckets_for_metric(ttft_matcher, &duration_bucket)
         .expect("failed to set ttft bucket")
         .set_buckets_for_metric(tpot_matcher, &duration_bucket)
-        .expect("failed to set tpot bucket")
+        .expect("failed to set tpot bucket");
+    for m in genai_dur_matchers {
+        builder = builder
+            .set_buckets_for_metric(m, &duration_bucket)
+            .expect("failed to set gen_ai duration bucket");
+    }
+    builder = builder
+        .set_buckets_for_metric(genai_token_matcher, &token_bucket)
+        .expect("failed to set gen_ai token bucket");
+    builder
         .set_buckets_for_metric(
             canary_matcher,
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
@@ -709,8 +757,15 @@ impl Metrics {
             "router_type" => router_type,
             "backend_type" => backend_type,
             "connection_mode" => connection_mode,
-            "model" => model,
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+        // OTel GenAI-semconv alias (dashboard compatibility); see init() describe.
+        histogram!(
+            "gen_ai_server_request_duration",
+            "gen_ai_request_model" => model,
+            "gen_ai_operation_name" => endpoint
         )
         .record(duration.as_secs_f64());
     }
@@ -789,8 +844,14 @@ impl Metrics {
             "smg_router_ttft_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model,
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+        // OTel GenAI-semconv alias (dashboard compatibility).
+        histogram!(
+            "gen_ai_server_time_to_first_token",
+            "gen_ai_request_model" => model
         )
         .record(duration.as_secs_f64());
     }
@@ -808,8 +869,14 @@ impl Metrics {
             "smg_router_tpot_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model,
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+        // OTel GenAI-semconv alias (dashboard compatibility).
+        histogram!(
+            "gen_ai_server_time_per_output_token",
+            "gen_ai_request_model" => model
         )
         .record(duration.as_secs_f64());
     }
@@ -828,11 +895,20 @@ impl Metrics {
             "smg_router_tokens_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model,
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint,
             "token_type" => token_type
         )
         .increment(count);
+        // OTel GenAI-semconv alias (dashboard compatibility): a HISTOGRAM whose
+        // _sum totals tokens (NOT a counter), matching the AI Gateway's
+        // gen_ai_client_token_usage. token_type is already "input"/"output".
+        histogram!(
+            "gen_ai_client_token_usage",
+            "gen_ai_request_model" => model,
+            "gen_ai_token_type" => token_type
+        )
+        .record(count as f64);
     }
 
     /// Record total generation duration.
@@ -884,6 +960,12 @@ impl Metrics {
                 "endpoint" => endpoint
             )
             .record(ttft_duration.as_secs_f64());
+            // OTel GenAI-semconv alias (dashboard compatibility).
+            histogram!(
+                "gen_ai_server_time_to_first_token",
+                "gen_ai_request_model" => Arc::clone(&model)
+            )
+            .record(ttft_duration.as_secs_f64());
 
             // TPOT - only meaningful with >1 output token
             if output_tokens > 1 {
@@ -895,6 +977,12 @@ impl Metrics {
                     "backend_type" => backend_type,
                     "model" => Arc::clone(&model),
                     "endpoint" => endpoint
+                )
+                .record(tpot.as_secs_f64());
+                // OTel GenAI-semconv alias (dashboard compatibility).
+                histogram!(
+                    "gen_ai_server_time_per_output_token",
+                    "gen_ai_request_model" => Arc::clone(&model)
                 )
                 .record(tpot.as_secs_f64());
             }
@@ -921,6 +1009,14 @@ impl Metrics {
                 "token_type" => metrics_labels::TOKEN_INPUT
             )
             .increment(input);
+            // OTel GenAI-semconv alias (dashboard compatibility): histogram whose
+            // _sum totals input tokens.
+            histogram!(
+                "gen_ai_client_token_usage",
+                "gen_ai_request_model" => Arc::clone(&model),
+                "gen_ai_token_type" => metrics_labels::TOKEN_INPUT
+            )
+            .record(input as f64);
         }
 
         // Output tokens (always recorded - move model on final use)
@@ -928,11 +1024,19 @@ impl Metrics {
             "smg_router_tokens_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model,
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint,
             "token_type" => metrics_labels::TOKEN_OUTPUT
         )
         .increment(output_tokens);
+        // OTel GenAI-semconv alias (dashboard compatibility): histogram whose
+        // _sum totals output tokens.
+        histogram!(
+            "gen_ai_client_token_usage",
+            "gen_ai_request_model" => model,
+            "gen_ai_token_type" => metrics_labels::TOKEN_OUTPUT
+        )
+        .record(output_tokens as f64);
     }
 
     // ========================================================================
@@ -2166,6 +2270,92 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    // The token-usage Grafana dashboard (model-registry-service) queries the
+    // Envoy AI Gateway's OTel gen_ai_* series. SMG must dual-emit them so the
+    // dashboard works unchanged for SMG-routed models. This asserts the exact
+    // series + labels every dashboard query needs are present in the scrape.
+    #[test]
+    fn test_gen_ai_semconv_aliases_emitted_for_dashboard() {
+        // Mirror production bucket wiring so the gen_ai_* histograms render as
+        // _bucket (not summaries) — exactly what the dashboard's
+        // histogram_quantile(... _bucket ...) queries require. A bare recorder
+        // would render summaries and hide the real production requirement.
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("gen_ai_server_request_duration")),
+                &[0.1, 0.5, 1.0, 2.5],
+            )
+            .expect("bucket")
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("gen_ai_server_time_to_first_token")),
+                &[0.1, 0.5, 1.0, 2.5],
+            )
+            .expect("bucket")
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("gen_ai_server_time_per_output_token")),
+                &[0.01, 0.05, 0.1],
+            )
+            .expect("bucket")
+            .set_buckets_for_metric(
+                Matcher::Full(String::from("gen_ai_client_token_usage")),
+                &[1.0, 16.0, 64.0, 256.0],
+            )
+            .expect("bucket")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_streaming_metrics(StreamingMetricsParams {
+                router_type: "grpc",
+                backend_type: "regular",
+                model_id: "llama",
+                endpoint: metrics_labels::ENDPOINT_CHAT,
+                ttft: Some(Duration::from_millis(120)),
+                generation_duration: Duration::from_millis(800),
+                input_tokens: Some(40),
+                output_tokens: 10,
+            });
+            Metrics::record_router_duration(
+                "grpc",
+                "regular",
+                "grpc",
+                "llama",
+                metrics_labels::ENDPOINT_CHAT,
+                Duration::from_millis(950),
+            );
+        });
+        let rendered = handle.render();
+
+        // Token usage: histogram _sum totals tokens, split by gen_ai_token_type.
+        assert!(
+            rendered.contains("gen_ai_client_token_usage_sum")
+                && rendered.contains("gen_ai_token_type=\"input\"")
+                && rendered.contains("gen_ai_token_type=\"output\"")
+                && rendered.contains("gen_ai_request_model=\"llama\""),
+            "gen_ai_client_token_usage missing series/labels; rendered:\n{rendered}"
+        );
+        // Request duration: histogram with model + operation_name labels.
+        assert!(
+            rendered.contains("gen_ai_server_request_duration_bucket")
+                && rendered.contains("gen_ai_operation_name=\"chat\""),
+            "gen_ai_server_request_duration missing; rendered:\n{rendered}"
+        );
+        // TTFT + TPOT histograms.
+        assert!(
+            rendered.contains("gen_ai_server_time_to_first_token_bucket"),
+            "gen_ai_server_time_to_first_token missing; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("gen_ai_server_time_per_output_token_bucket"),
+            "gen_ai_server_time_per_output_token missing; rendered:\n{rendered}"
+        );
+        // Additive guarantee: the smg_* originals are still emitted.
+        assert!(
+            rendered.contains("smg_router_tokens_total")
+                && rendered.contains("smg_router_ttft_seconds"),
+            "smg_* metrics must remain (additive); rendered:\n{rendered}"
         );
     }
 }

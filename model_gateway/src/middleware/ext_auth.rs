@@ -23,31 +23,48 @@ const DEFAULT_TIMEOUT_MS: u64 = 500;
 
 /// HTTP headers forwarded from the inbound request to the ext-auth endpoint.
 /// The ext-auth handler reads identity solely from headers (body is empty),
-/// so this list is the input contract.
+/// so this list is the input contract. Kept in lockstep with
+/// model-registry-service routesecurity.requestHeadersToExtAuth (the
+/// SecurityPolicy.spec.extAuth.headersToExtAuth the Envoy AI Gateway sends to
+/// the SAME regional-auth-service /ext-auth): Authorization, X-AI-EG-Model,
+/// X-Request-ID, X-Project-ID, X-User-ID. x-api-key / x-region-id / region-id
+/// are SMG supersets the handler ignores when absent — harmless to forward.
 const FORWARD_HEADERS: &[&str] = &[
     "authorization",
-    "x-api-key",
+    "x-ai-eg-model",
+    "x-request-id",
     "x-project-id",
     "x-user-id",
-    "x-ai-eg-model",
+    "x-api-key",
     "x-region-id",
     "region-id",
 ];
 
 /// HTTP headers copied from the ext-auth response onto the request that proceeds
-/// to the worker. These carry the resolved tenant / pricing context downstream
-/// Kafka usage events depend on.
+/// to the worker. These carry the resolved tenant / pricing / concurrency
+/// context downstream Kafka usage events and the rate/credit/concurrency
+/// enforcement depend on. Kept in lockstep with model-registry-service
+/// routesecurity.responseHeadersToBackend (the SecurityPolicy
+/// headersToBackend the Envoy AI Gateway path injects) so SMG's in-process
+/// ext-auth enforces the SAME contract: missing entries here silently drop
+/// free-tier (x-is-free), credit (x-credit-remaining), rate-limit, and MaaS
+/// concurrency-slot enforcement.
 const INJECT_HEADERS: &[&str] = &[
+    "authorization",
+    "x-ai-eg-model",
+    "x-request-id",
+    "x-api-key-id",
     "x-project-id",
     "x-model-id",
-    "x-api-key-id",
+    "x-model-name",
     "x-input-price",
     "x-output-price",
-    "x-model-name",
-    "x-ai-eg-model",
-    "x-ratelimit-remaining",
     "x-credit-remaining",
+    "x-is-free",
+    "x-rate-limit-remaining",
     "x-user-id",
+    "x-maas-concurrency-slot",
+    "x-maas-model-concurrency-slot",
 ];
 
 /// Static config for the ext-auth middleware. Lives in [`ServerConfig`].
@@ -166,6 +183,10 @@ pub async fn ext_auth_middleware(
 
 fn copy_inject_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     for name in INJECT_HEADERS {
+        if dst.contains_key(*name) {
+            continue;
+        }
+
         if let Some(value) = src.get(*name) {
             if let (Ok(header_name), Ok(header_value)) = (
                 HeaderName::from_bytes(name.as_bytes()),

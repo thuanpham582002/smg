@@ -4,9 +4,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, KafkaUsageConfig, MemoryRuntimeConfig, MetricsConfig, OracleConfig,
-    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-    RoutingMode, SkillsConfig, TokenizerCacheConfig, TraceConfig,
+    HistoryBackend, KafkaUsageConfig, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::ConnectionMode;
 
@@ -386,6 +386,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn model_selector_header<S: Into<String>>(mut self, header: S) -> Self {
+        self.config.model_selector_header = Some(header.into());
+        self
+    }
+
     pub fn storage_context_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.config.storage_context_headers = headers;
         self
@@ -596,6 +601,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_request_id_headers(mut self, headers: Option<Vec<String>>) -> Self {
         self.config.request_id_headers = headers;
+        self
+    }
+
+    pub fn maybe_model_selector_header(mut self, header: Option<impl Into<String>>) -> Self {
+        self.config.model_selector_header = header.map(Into::into);
         self
     }
 

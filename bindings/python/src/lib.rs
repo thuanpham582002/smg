@@ -613,6 +613,7 @@ impl Router {
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
+                crd_workers: false,
             })
         } else {
             None
@@ -1188,6 +1189,7 @@ impl Router {
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source,
+                crd_workers: false,
             })
         } else {
             None
@@ -1227,6 +1229,7 @@ impl Router {
                     .control_plane_auth
                     .as_ref()
                     .map(|c| c.to_auth_control_plane_config()),
+                ext_auth: None,
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
                         use rand::{distr::Alphanumeric, RngExt};

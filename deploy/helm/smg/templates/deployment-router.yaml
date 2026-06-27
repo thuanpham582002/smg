@@ -100,6 +100,30 @@ spec:
                   name: {{ include "smg.fullname" . }}-hf-token
                   key: token
             {{- end }}
+            {{- if .Values.router.configMap.enabled }}
+            - name: EXT_AUTH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: EXT_AUTH_URL
+                  optional: true
+            - name: EXT_AUTH_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: EXT_AUTH_TIMEOUT_MS
+            - name: EXT_AUTH_FAIL_OPEN_ON_TRANSPORT_ERROR
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: EXT_AUTH_FAIL_OPEN_ON_TRANSPORT_ERROR
+            - name: MODEL_SELECTOR_HEADER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: MODEL_SELECTOR_HEADER
+                  optional: true
+            {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

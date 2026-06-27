@@ -1,0 +1,84 @@
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgGateway
+metadata:
+  name: selfheal-test
+  namespace: aip-5f62e802acfe4cb9a64cd08671156f0b
+spec:
+  routing:
+    policy: weighted_sticky
+  serviceDiscovery:
+    crds:
+      enabled: true
+  modelSelector:
+    headerName: x-ai-eg-model
+  routes:
+    - name: r1
+      matches:
+        - path:
+            type: PathPrefix
+            value: /selfheal-test-114931
+          headers:
+            - name: x-ai-eg-model
+              type: Exact
+              value: qwen3-8b
+      backendRefs:
+        - name: ep-7bb15a5b-selfheal-test-frontend
+          modelNameOverride: qwen3.6
+          priority: 0
+          weight: 50
+        - name: ep-7bb15a5b-selfheal-test-frontend-split-b
+          modelNameOverride: qwen3.6
+          priority: 0
+          weight: 50
+      modelsOwnedBy: Envoy AI Gateway
+  extAuth:
+    serviceName: regional-auth-backend
+    namespace: aip-5f62e802acfe4cb9a64cd08671156f0b
+    port: 8080
+    path: /ext-auth
+    timeoutMs: 500
+    failOpenOnTransportError: false
+---
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgWorker
+metadata:
+  name: ep-7bb15a5b-selfheal-test-frontend
+  namespace: aip-5f62e802acfe4cb9a64cd08671156f0b
+  labels:
+    smg.lightseek.io/gateway: selfheal-test
+spec:
+  url: http://ep-7bb15a5b-selfheal-test-frontend.aip-5f62e802acfe4cb9a64cd08671156f0b.svc.cluster.local:8000
+  models:
+    - id: qwen3-8b
+      aliases:
+        - qwen3.6
+  servedModelName: qwen3.6
+  runtimeType: external
+  routingWeight: 50
+  labels:
+    smg.lightseek.io/gateway: selfheal-test
+    backend: dynamo-frontend
+    endpoint: ep-7bb15a5b-selfheal-test
+    split-worker: a
+---
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgWorker
+metadata:
+  name: ep-7bb15a5b-selfheal-test-frontend-split-b
+  namespace: aip-5f62e802acfe4cb9a64cd08671156f0b
+  labels:
+    smg.lightseek.io/gateway: selfheal-test
+spec:
+  url: http://ep-7bb15a5b-selfheal-test-frontend.aip-5f62e802acfe4cb9a64cd08671156f0b.svc:8000
+  models:
+    - id: qwen3-8b
+      aliases:
+        - qwen3.6
+  servedModelName: qwen3.6
+  runtimeType: external
+  routingWeight: 50
+  labels:
+    smg.lightseek.io/gateway: selfheal-test
+    backend: dynamo-frontend
+    endpoint: ep-7bb15a5b-selfheal-test
+    split-worker: b

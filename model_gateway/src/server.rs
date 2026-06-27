@@ -66,6 +66,21 @@ use crate::{
         Job, TokenizerConfigRequest, WorkflowEngines,
     },
 };
+fn selected_route_model<'a>(
+    headers: &'a HeaderMap,
+    body_model: &'a str,
+    config: &RouterConfig,
+) -> &'a str {
+    config
+        .model_selector_header
+        .as_deref()
+        .and_then(|header| headers.get(header))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(body_model)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -160,11 +175,12 @@ async fn v1_chat_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    let route_model = selected_route_model(&headers, &body.model, &state.context.router_config);
     cancel
         .guard(
             state
                 .router
-                .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
+                .route_chat(Some(&headers), &tenant_meta, &body, route_model),
         )
         .await
 }
@@ -1311,7 +1327,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         probe_state,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
+        if service_discovery_config.enabled || service_discovery_config.crd_workers {
             let app_context_arc = Arc::clone(&app_state.context);
 
             match start_service_discovery(

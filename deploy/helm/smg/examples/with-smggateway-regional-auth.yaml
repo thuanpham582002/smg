@@ -1,0 +1,28 @@
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgGateway
+metadata:
+  name: regional
+spec:
+  routing:
+    policy: weighted_sticky
+  serviceDiscovery:
+    crds:
+      enabled: true
+  extAuth:
+    serviceName: regional-auth-backend
+    namespace: ai-demo-project
+    port: 8080
+    path: /ext-auth
+    timeoutMs: 500
+    failOpenOnTransportError: false
+---
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgWorker
+metadata:
+  name: llama3-vllm-a
+spec:
+  url: http://vllm-a.default.svc.cluster.local:8000
+  servedModelName: llama3
+  routingWeight: 100
+  labels:
+    pool: regional

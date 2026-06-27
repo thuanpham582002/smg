@@ -53,7 +53,11 @@ Router image
 {{- $registry := .Values.global.image.registry -}}
 {{- $repository := .Values.global.image.repository -}}
 {{- $tag := .Values.global.image.tag | default .Chart.AppVersion -}}
+{{- if $registry -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- else -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -150,6 +154,24 @@ Called from the router Deployment template.
 - {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.router.serviceDiscovery.crds.enabled }}
+- "--service-discovery-crds"
+{{- if and (not .Values.router.serviceDiscovery.enabled) (not .Values.router.serviceDiscovery.clusterWide) }}
+- "--service-discovery-namespace"
+- {{ .Values.router.serviceDiscovery.namespace | default .Release.Namespace | quote }}
+{{- end }}
+{{- end }}
+{{- if and .Values.router.extAuth.url (not .Values.router.configMap.enabled) }}
+- "--ext-auth-url"
+- {{ .Values.router.extAuth.url | quote }}
+{{- end }}
+{{- if and .Values.router.extAuth.timeoutMs (not .Values.router.configMap.enabled) }}
+- "--ext-auth-timeout-ms"
+- {{ .Values.router.extAuth.timeoutMs | quote }}
+{{- end }}
+{{- if and .Values.router.extAuth.failOpenOnTransportError (not .Values.router.configMap.enabled) }}
+- "--ext-auth-fail-open-on-transport-error"
+{{- end }}
 {{- if .Values.router.model }}
 - "--model-path"
 - {{ .Values.router.model | quote }}
@@ -178,8 +200,7 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
-- "--max-concurrent-requests"
-- {{ .Values.router.maxConcurrentRequests | quote }}
+- "--max-concurrent-requests={{ .Values.router.maxConcurrentRequests }}"
 - "--queue-size"
 - {{ .Values.router.queueSize | quote }}
 - "--queue-timeout-secs"

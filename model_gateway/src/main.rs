@@ -329,6 +329,14 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
 
+    /// Watch SmgWorker custom resources and register them as workers.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    service_discovery_crds: bool,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -429,6 +437,10 @@ struct CliArgs {
     /// Custom HTTP headers to check for request IDs
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     request_id_headers: Vec<String>,
+
+    /// Header whose value overrides the request body model for routing/model mapping.
+    #[arg(long, env = "MODEL_SELECTOR_HEADER", help_heading = "Request Handling")]
+    model_selector_header: Option<String>,
 
     /// Map HTTP headers into storage hook request context (format: header=context_key)
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
@@ -1296,9 +1308,9 @@ impl CliArgs {
 
         let policy = self.parse_policy(&self.policy);
 
-        let discovery = if self.service_discovery {
+        let discovery = if self.service_discovery || self.service_discovery_crds {
             Some(DiscoveryConfig {
-                enabled: true,
+                enabled: self.service_discovery,
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
@@ -1309,6 +1321,7 @@ impl CliArgs {
                 router_selector: Self::parse_selector(&self.router_selector),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
+                crd_workers: self.service_discovery_crds,
             })
         } else {
             None
@@ -1446,6 +1459,7 @@ impl CliArgs {
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
+            .maybe_model_selector_header(self.model_selector_header.as_ref())
             .maybe_storage_context_headers(
                 (!self.storage_context_headers.is_empty())
                     .then(|| Self::parse_selector(&self.storage_context_headers)),
@@ -1481,7 +1495,7 @@ impl CliArgs {
     }
 
     fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
-        let service_discovery_config = if self.service_discovery {
+        let service_discovery_config = if self.service_discovery || self.service_discovery_crds {
             // Get router discovery config from router_config.discovery if available
             let (router_selector, router_mesh_port_annotation) = router_config
                 .discovery
@@ -1513,7 +1527,7 @@ impl CliArgs {
                 .transpose()?;
 
             Some(ServiceDiscoveryConfig {
-                enabled: true,
+                enabled: self.service_discovery,
                 selector: Self::parse_selector(&self.selector),
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
@@ -1525,6 +1539,7 @@ impl CliArgs {
                 router_selector,
                 router_mesh_port_annotation,
                 model_id_source,
+                crd_workers: self.service_discovery_crds,
             })
         } else {
             None
@@ -1576,9 +1591,7 @@ impl CliArgs {
             ext_auth: self.ext_auth_url.as_ref().map(|url| {
                 smg::middleware::ExtAuthConfig::new(Some(url.clone()))
                     .with_timeout_ms(self.ext_auth_timeout_ms)
-                    .with_fail_open_on_transport_error(
-                        self.ext_auth_fail_open_on_transport_error,
-                    )
+                    .with_fail_open_on_transport_error(self.ext_auth_fail_open_on_transport_error)
             }),
             mesh_server_config,
             webrtc_bind_addr: self.webrtc_bind_addr,

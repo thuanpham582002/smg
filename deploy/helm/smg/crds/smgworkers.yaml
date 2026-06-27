@@ -1,0 +1,92 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: smgworkers.smg.lightseek.io
+spec:
+  group: smg.lightseek.io
+  names:
+    kind: SmgWorker
+    listKind: SmgWorkerList
+    plural: smgworkers
+    singular: smgworker
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [url]
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                url:
+                  type: string
+                models:
+                  x-kubernetes-preserve-unknown-fields: true
+                servedModelName:
+                  type: string
+                workerType:
+                  type: string
+                  enum: [regular, prefill, decode]
+                connectionMode:
+                  type: string
+                runtimeType:
+                  type: string
+                provider:
+                  type: string
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+                priority:
+                  type: integer
+                  minimum: 0
+                cost:
+                  type: number
+                routingWeight:
+                  type: integer
+                  minimum: 0
+                bootstrapPort:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                dpBaseUrl:
+                  type: string
+                dpRank:
+                  type: integer
+                  minimum: 0
+                dpSize:
+                  type: integer
+                  minimum: 1
+                kvConnector:
+                  type: string
+                kvRole:
+                  type: string
+                kvEngineId:
+                  type: string
+                kvBlockSize:
+                  type: integer
+                  minimum: 1
+                health:
+                  x-kubernetes-preserve-unknown-fields: true
+                httpPool:
+                  x-kubernetes-preserve-unknown-fields: true
+                resilience:
+                  x-kubernetes-preserve-unknown-fields: true
+                loadMonitorIntervalSecs:
+                  type: integer
+                  minimum: 1
+            status:
+              type: object
+              properties:
+                registered:
+                  type: boolean
+                reason:
+                  type: string
+      subresources:
+        status: {}

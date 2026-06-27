@@ -1,0 +1,23 @@
+{{- if .Values.router.configMap.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "smg.fullname" . }}-router-config
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+    app.kubernetes.io/part-of: smg
+    smg.lightseek.io/config-kind: router
+data:
+  {{- if .Values.router.extAuth.url }}
+  EXT_AUTH_URL: {{ .Values.router.extAuth.url | quote }}
+  {{- end }}
+  EXT_AUTH_TIMEOUT_MS: {{ .Values.router.extAuth.timeoutMs | quote }}
+  EXT_AUTH_FAIL_OPEN_ON_TRANSPORT_ERROR: {{ .Values.router.extAuth.failOpenOnTransportError | quote }}
+  {{- if .Values.router.modelSelector.headerName }}
+  MODEL_SELECTOR_HEADER: {{ .Values.router.modelSelector.headerName | quote }}
+  {{- end }}
+  {{- with .Values.router.configMap.extraData }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}

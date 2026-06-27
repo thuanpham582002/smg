@@ -45,6 +45,24 @@ router:
     port: 80
     # -- Extract model ID from pod metadata
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
+    crds:
+      enabled: false       # watch smg.lightseek.io/v1alpha1 SmgWorker resources
+
+  # -- External authorization for protected inference routes
+  extAuth:
+    url: ""                # e.g. http://regional-auth.default.svc.cluster.local:8080/ext-auth
+    timeoutMs: 500
+    failOpenOnTransportError: false
+
+  # -- Request header used as the public model selector before falling back to body.model.
+  #    Leave empty to disable header-based model selection.
+  modelSelector:
+    headerName: ""
+
+  # -- ConfigMap-backed runtime settings. Keeps auth/config changes out of Pod args.
+  configMap:
+    enabled: true
+    extraData: {}
 
   # -- Model / tokenizer
   model: ""                # HuggingFace model ID or local path

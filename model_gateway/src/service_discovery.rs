@@ -11,14 +11,17 @@ use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::{Api, ListParams},
+    core::CustomResourceExt,
     runtime::{
-        watcher::{watcher, Config},
+        watcher::{watcher, Config, Event},
         WatchStreamExt,
     },
-    Client,
+    Client, CustomResource,
 };
 use openai_protocol::worker::{WorkerSpec, WorkerType};
 use rustls::crypto::ring;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use smg_mesh::{
     gossip::{NodeState, NodeStatus},
     ClusterState,
@@ -103,9 +106,39 @@ pub struct ServiceDiscoveryConfig {
     pub router_mesh_port_annotation: String,
     /// Per-worker model_id override source from pod metadata.
     pub model_id_source: Option<ModelIdSource>,
+    /// Watch SmgWorker custom resources and register them as workers.
+    pub crd_workers: bool,
+}
+
+#[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "smg.lightseek.io",
+    version = "v1alpha1",
+    kind = "SmgWorker",
+    plural = "smgworkers",
+    namespaced,
+    status = "SmgWorkerStatus"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SmgWorkerSpec {
+    #[serde(flatten)]
+    pub worker: WorkerSpec,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SmgWorkerStatus {
+    #[serde(default)]
+    pub registered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl ServiceDiscoveryConfig {
+    pub fn crd_yaml() -> Result<String, serde_yaml::Error> {
+        serde_yaml::to_string(&SmgWorker::crd())
+    }
+
     /// Build a label selector string for K8s list calls.
     ///
     /// In regular mode, uses the worker selector directly.
@@ -173,6 +206,7 @@ impl Default for ServiceDiscoveryConfig {
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
+            crd_workers: false,
         }
     }
 }
@@ -360,7 +394,7 @@ pub async fn start_service_discovery(
     mesh_cluster_state: Option<ClusterState>,
     mesh_port: Option<u16>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    if !config.enabled {
+    if !config.enabled && !config.crd_workers {
         return Err(kube::Error::Api(
             kube::core::Status::failure("Service discovery is disabled", "ConfigurationError")
                 .with_code(400)
@@ -428,10 +462,32 @@ pub async fn start_service_discovery(
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
 
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
-            Api::namespaced(client, namespace)
+            Api::namespaced(client.clone(), namespace)
         } else {
-            Api::all(client)
+            Api::all(client.clone())
         };
+
+        if config.crd_workers {
+            let crd_workers: Api<SmgWorker> = if let Some(namespace) = &config.namespace {
+                Api::namespaced(client.clone(), namespace)
+            } else {
+                Api::all(client.clone())
+            };
+            let crd_context = Arc::clone(&app_context);
+            let crd_namespace = config.namespace.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "CRD discovery runs for the lifetime of the server"
+            )]
+            tokio::spawn(async move {
+                start_crd_worker_discovery(crd_workers, crd_context, crd_namespace).await;
+            });
+        }
+
+        if !config.enabled {
+            info!("Pod service discovery disabled; CRD worker discovery remains active");
+            std::future::pending::<()>().await;
+        }
 
         debug!("K8s service discovery initialized");
 
@@ -619,6 +675,106 @@ pub async fn start_service_discovery(
     });
 
     Ok(handle)
+}
+
+async fn start_crd_worker_discovery(
+    workers: Api<SmgWorker>,
+    app_context: Arc<AppContext>,
+    namespace: Option<String>,
+) {
+    info!(
+        "Starting SmgWorker CRD discovery | namespace: {}",
+        namespace.as_deref().unwrap_or("<all>")
+    );
+
+    let mut retry_delay = Duration::from_secs(1);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+    loop {
+        let watcher_ok = watcher(workers.clone(), Config::default())
+            .try_for_each(|event| {
+                let app_context = Arc::clone(&app_context);
+                async move {
+                    match event {
+                        Event::Apply(worker) | Event::InitApply(worker) => {
+                            handle_crd_worker_apply(&worker, Arc::clone(&app_context)).await;
+                        }
+                        Event::Delete(worker) => {
+                            handle_crd_worker_delete(&worker, Arc::clone(&app_context)).await;
+                        }
+                        Event::Init | Event::InitDone => {}
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+
+        match watcher_ok {
+            Ok(()) => retry_delay = Duration::from_secs(1),
+            Err(err) => {
+                error!("Error in SmgWorker CRD watcher: {}", err);
+                warn!(
+                    "Retrying SmgWorker CRD watcher in {} seconds",
+                    retry_delay.as_secs()
+                );
+                time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+            }
+        }
+
+        warn!("SmgWorker CRD watcher exited, restarting");
+        time::sleep(retry_delay).await;
+    }
+}
+
+async fn handle_crd_worker_apply(worker: &SmgWorker, app_context: Arc<AppContext>) {
+    let mut spec = worker.spec.worker.clone();
+    if spec.api_key.is_none() {
+        spec.api_key.clone_from(&app_context.router_config.api_key);
+    }
+
+    let url = spec.url.clone();
+    let name = worker.metadata.name.as_deref().unwrap_or("<unknown>");
+    info!("Applying SmgWorker {} | url: {}", name, url);
+
+    let job = Job::AddWorker {
+        config: Box::new(spec),
+    };
+
+    if let Some(job_queue) = app_context.worker_job_queue.get() {
+        match job_queue.submit(job).await {
+            Ok(()) => Metrics::record_discovery_registration(
+                metrics_labels::DISCOVERY_KUBERNETES,
+                metrics_labels::REGISTRATION_SUCCESS,
+            ),
+            Err(e) => error!("Failed to submit SmgWorker addition for {}: {}", url, e),
+        }
+    } else {
+        error!("JobQueue not initialized, cannot add SmgWorker {}", url);
+    }
+}
+
+async fn handle_crd_worker_delete(worker: &SmgWorker, app_context: Arc<AppContext>) {
+    let url = worker.spec.worker.url.clone();
+    let name = worker.metadata.name.as_deref().unwrap_or("<unknown>");
+    info!("Deleting SmgWorker {} | url: {}", name, url);
+
+    let job = Job::RemoveWorker {
+        url: url.clone(),
+        expected_revision: None,
+    };
+
+    if let Some(job_queue) = app_context.worker_job_queue.get() {
+        match job_queue.submit(job).await {
+            Ok(()) => Metrics::record_discovery_deregistration(
+                metrics_labels::DISCOVERY_KUBERNETES,
+                metrics_labels::DEREGISTRATION_POD_DELETED,
+            ),
+            Err(e) => error!("Failed to submit SmgWorker removal for {}: {}", url, e),
+        }
+    } else {
+        error!("JobQueue not initialized, cannot remove SmgWorker {}", url);
+    }
 }
 
 async fn handle_pod_event(
@@ -1346,6 +1502,7 @@ mod tests {
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
+            crd_workers: false,
         }
     }
 

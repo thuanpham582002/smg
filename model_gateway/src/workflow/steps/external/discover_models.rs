@@ -271,7 +271,22 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
         }
 
         let config = &context.data.config;
-        let provider = ProviderType::from_url(&config.url);
+        let provider = ProviderType::from_url(&config.url).or_else(|| config.provider.clone());
+
+        if !config.models.is_wildcard() {
+            context.data.model_cards = config.models.all().to_vec();
+            info!(
+                "Using configured models for external endpoint {}: {:?}",
+                config.url,
+                context
+                    .data
+                    .model_cards
+                    .iter()
+                    .map(|card| &card.id)
+                    .collect::<Vec<_>>()
+            );
+            return Ok(StepResult::Success);
+        }
 
         // Resolve discovery API key: env var admin key > config.api_key > None (wildcard)
         let discovery_key =

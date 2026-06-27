@@ -110,7 +110,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)
                 .priority(config.priority)
-                .cost(config.cost);
+                .cost(config.cost)
+                .routing_weight(config.routing_weight);
+
+            if let Some(ref served_model_name) = config.served_model_name {
+                builder = builder.served_model_name(served_model_name);
+            }
 
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());
@@ -136,8 +141,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 config.url
             );
 
+            let models = config.models.all().to_vec();
             let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
-                .models(model_cards.clone())
+                .models(models)
                 .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Http)
                 .runtime_type(RuntimeType::External)
@@ -147,7 +153,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
                 .health_config(health_config.clone())
                 .health_endpoint(&health_endpoint)
                 .priority(config.priority)
-                .cost(config.cost);
+                .cost(config.cost)
+                .routing_weight(config.routing_weight);
+
+            if let Some(ref served_model_name) = config.served_model_name {
+                builder = builder.served_model_name(served_model_name);
+            }
 
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());

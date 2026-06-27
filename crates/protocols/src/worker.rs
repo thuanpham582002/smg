@@ -579,19 +579,23 @@ pub struct WorkerSpec {
 
     /// Backend-specific served model name to put in forwarded request bodies.
     /// When unset, SMG forwards the client-provided model value unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "servedModelName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub served_model_name: Option<String>,
 
     /// Worker type: regular, prefill, or decode.
-    #[serde(default)]
+    #[serde(default, alias = "workerType")]
     pub worker_type: WorkerType,
 
     /// Connection mode: http or grpc.
-    #[serde(default)]
+    #[serde(default, alias = "connectionMode")]
     pub connection_mode: ConnectionMode,
 
     /// Runtime type: sglang, vllm, trtllm, or external.
-    #[serde(default, alias = "runtime")]
+    #[serde(default, alias = "runtime", alias = "runtimeType")]
     pub runtime_type: RuntimeType,
 
     /// External provider for API transformations.
@@ -611,7 +615,7 @@ pub struct WorkerSpec {
     pub cost: f32,
 
     /// Relative routing weight for policies that support weighted selection.
-    #[serde(default = "default_routing_weight")]
+    #[serde(default = "default_routing_weight", alias = "routingWeight")]
     pub routing_weight: u32,
 
     /// Worker API key. Accepted on input, never included in responses.
@@ -620,10 +624,12 @@ pub struct WorkerSpec {
 
     /// Bootstrap port for prefill workers in PD disaggregated mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "bootstrapPort")]
     pub bootstrap_port: Option<u16>,
 
     /// Bootstrap hostname (derived from URL at construction time).
     #[serde(default, skip)]
+    #[serde(alias = "bootstrapHost")]
     pub bootstrap_host: String,
 
     /// Base URL without DP rank suffix (for DP-aware workers).
@@ -677,6 +683,7 @@ pub struct WorkerSpec {
     /// When set, workers in the same group use this interval for load polling.
     /// Falls back to the global `load_monitor_interval_secs` from router config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "loadMonitorIntervalSecs")]
     pub load_monitor_interval_secs: Option<u64>,
 }
 

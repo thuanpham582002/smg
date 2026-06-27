@@ -55,6 +55,8 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selector_header: Option<String>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
@@ -534,6 +536,9 @@ pub struct DiscoveryConfig {
     /// Source for per-worker model_id override: "namespace", "label:<key>", or "annotation:<key>"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id_source: Option<String>,
+    /// Watch SmgWorker custom resources and register them as workers.
+    #[serde(default)]
+    pub crd_workers: bool,
 }
 
 fn default_router_mesh_port_annotation() -> String {
@@ -554,6 +559,7 @@ impl Default for DiscoveryConfig {
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
             model_id_source: None,
+            crd_workers: false,
         }
     }
 }
@@ -840,6 +846,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            model_selector_header: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),
             max_concurrent_requests: -1,
@@ -1284,6 +1291,7 @@ mod tests {
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
+            crd_workers: false,
         };
 
         assert!(config.enabled);
@@ -1563,6 +1571,7 @@ mod tests {
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: None,
+                crd_workers: false,
             })
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")

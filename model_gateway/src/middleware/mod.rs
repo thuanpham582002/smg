@@ -17,10 +17,10 @@ pub mod token_bucket;
 pub mod wasm;
 
 pub use auth::{auth_middleware, AuthConfig};
-pub use ext_auth::{ext_auth_middleware, ExtAuthConfig, ExtAuthState};
 pub use concurrency::{
     concurrency_limit_middleware, ConcurrencyLimiter, QueueProcessor, QueuedRequest, TokenGuardBody,
 };
+pub use ext_auth::{ext_auth_middleware, ExtAuthConfig, ExtAuthState};
 pub use logging::{create_logging_layer, RequestLogger, RequestSpan, ResponseLogger};
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
