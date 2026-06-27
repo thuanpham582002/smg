@@ -538,10 +538,28 @@ impl Serialize for WorkerModels {
     }
 }
 
-/// Deserialize from `Vec<ModelCard>` for wire compatibility.
+/// Deserialize from `Vec<ModelCard>` for wire compatibility. Each element may
+/// be EITHER a full ModelCard object OR a bare model-id string: producers like
+/// the model-registry SMG router emit `models: ["mr-<id>"]`, while richer
+/// producers emit `[{"id": ...}]`. A string `s` is promoted to `ModelCard::new(s)`
+/// so both wire shapes are accepted (and the watcher never crash-loops on the
+/// simple form).
 impl<'de> Deserialize<'de> for WorkerModels {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let models = Vec::<ModelCard>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrCard {
+            Str(String),
+            Card(Box<ModelCard>),
+        }
+        let raw = Vec::<StringOrCard>::deserialize(deserializer)?;
+        let models = raw
+            .into_iter()
+            .map(|item| match item {
+                StringOrCard::Str(s) => ModelCard::new(s),
+                StringOrCard::Card(c) => *c,
+            })
+            .collect::<Vec<_>>();
         Ok(Self::from(models))
     }
 }
@@ -1408,5 +1426,47 @@ mod health_check_drain_settle_tests {
         }"#;
         let cfg: HealthCheckConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.drain_settle_secs, 5);
+    }
+}
+
+#[cfg(test)]
+mod worker_models_wire_compat_tests {
+    use super::WorkerSpec;
+
+    // The model-registry SMG router emits models as bare id strings; richer
+    // producers emit ModelCard objects. Both must deserialize (regression: the
+    // CRD watcher crash-looped on the string form expecting a ModelCard struct).
+    #[test]
+    fn test_models_accepts_bare_string_ids() {
+        let json = r#"{
+            "url": "http://svc:8000",
+            "models": ["mr-6358ccf1-5305-4072-818a-0ca5de814e69"],
+            "servedModelName": "mr-6358ccf1-5305-4072-818a-0ca5de814e69"
+        }"#;
+        let spec: WorkerSpec = serde_json::from_str(json).unwrap();
+        let all = spec.models.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "mr-6358ccf1-5305-4072-818a-0ca5de814e69");
+    }
+
+    #[test]
+    fn test_models_accepts_model_card_objects() {
+        let json = r#"{
+            "url": "http://svc:8000",
+            "models": [{"id": "llama-3.1-8b"}]
+        }"#;
+        let spec: WorkerSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.models.all()[0].id, "llama-3.1-8b");
+    }
+
+    #[test]
+    fn test_models_mixed_string_and_object() {
+        let json = r#"{
+            "url": "http://svc:8000",
+            "models": ["a", {"id": "b"}]
+        }"#;
+        let spec: WorkerSpec = serde_json::from_str(json).unwrap();
+        let ids: Vec<_> = spec.models.all().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 }

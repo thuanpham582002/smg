@@ -160,6 +160,10 @@ Called from the router Deployment template.
 - "--service-discovery-namespace"
 - {{ .Values.router.serviceDiscovery.namespace | default .Release.Namespace | quote }}
 {{- end }}
+{{- range .Values.router.serviceDiscovery.crds.selector }}
+- "--service-discovery-crd-selector"
+- {{ . | quote }}
+{{- end }}
 {{- end }}
 {{- if and .Values.router.extAuth.url (not .Values.router.configMap.enabled) }}
 - "--ext-auth-url"

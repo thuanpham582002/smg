@@ -47,6 +47,12 @@ router:
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
     crds:
       enabled: false       # watch smg.lightseek.io/v1alpha1 SmgWorker resources
+      # -- Label selectors (key=value) scoping which SmgWorker CRs this gateway
+      #    discovers. Empty = all in the namespace. Set this when multiple
+      #    producers (e.g. dev + staging model-registry) emit SmgWorkers into
+      #    the SAME per-project namespace, to bind one gateway to one producer:
+      #      - modelregistry.ai-platform/instance=model_registry_dev
+      selector: []
 
   # -- External authorization for protected inference routes
   extAuth:
