@@ -108,6 +108,12 @@ pub struct ServiceDiscoveryConfig {
     pub model_id_source: Option<ModelIdSource>,
     /// Watch SmgWorker custom resources and register them as workers.
     pub crd_workers: bool,
+    /// Server-side label selector for SmgWorker CRD discovery. Empty = watch
+    /// every SmgWorker in the namespace. Set this to scope one gateway to the
+    /// CRs of a single producer (e.g. "modelregistry.ai-platform/instance=model_registry_dev")
+    /// when dev and staging model-registry instances emit into the SAME
+    /// per-project namespace.
+    pub crd_selector: HashMap<String, String>,
 }
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -173,6 +179,16 @@ impl ServiceDiscoveryConfig {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    /// Build a label selector string for the SmgWorker CRD watch. Empty =
+    /// watch every SmgWorker in the namespace (backward compatible).
+    fn crd_label_selector(&self) -> String {
+        self.crd_selector
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Build a kube watcher Config that pushes the given label selector down to
@@ -207,6 +223,7 @@ impl Default for ServiceDiscoveryConfig {
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
             crd_workers: false,
+            crd_selector: HashMap::new(),
         }
     }
 }
@@ -475,12 +492,14 @@ pub async fn start_service_discovery(
             };
             let crd_context = Arc::clone(&app_context);
             let crd_namespace = config.namespace.clone();
+            let crd_selector = config.crd_label_selector();
             #[expect(
                 clippy::disallowed_methods,
                 reason = "CRD discovery runs for the lifetime of the server"
             )]
             tokio::spawn(async move {
-                start_crd_worker_discovery(crd_workers, crd_context, crd_namespace).await;
+                start_crd_worker_discovery(crd_workers, crd_context, crd_namespace, crd_selector)
+                    .await;
             });
         }
 
@@ -681,17 +700,26 @@ async fn start_crd_worker_discovery(
     workers: Api<SmgWorker>,
     app_context: Arc<AppContext>,
     namespace: Option<String>,
+    label_selector: String,
 ) {
     info!(
-        "Starting SmgWorker CRD discovery | namespace: {}",
-        namespace.as_deref().unwrap_or("<all>")
+        "Starting SmgWorker CRD discovery | namespace: {} | selector: '{}'",
+        namespace.as_deref().unwrap_or("<all>"),
+        label_selector
     );
 
     let mut retry_delay = Duration::from_secs(1);
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
     loop {
-        let watcher_ok = watcher(workers.clone(), Config::default())
+        // Empty selector => Config::default() (watch all SmgWorkers), preserving
+        // prior behavior; a non-empty selector scopes the watch server-side.
+        let watcher_config = if label_selector.is_empty() {
+            Config::default()
+        } else {
+            Config::default().labels(&label_selector)
+        };
+        let watcher_ok = watcher(workers.clone(), watcher_config)
             .try_for_each(|event| {
                 let app_context = Arc::clone(&app_context);
                 async move {
@@ -1503,6 +1531,7 @@ mod tests {
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
             crd_workers: false,
+            crd_selector: HashMap::new(),
         }
     }
 
@@ -2661,6 +2690,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.list_label_selector(), "app=sglang");
+    }
+
+    #[test]
+    fn test_crd_label_selector_empty_by_default() {
+        // No CRD selector => watch every SmgWorker (backward compatible).
+        assert_eq!(ServiceDiscoveryConfig::default().crd_label_selector(), "");
+    }
+
+    #[test]
+    fn test_crd_label_selector_scopes_to_instance() {
+        let mut crd_selector = HashMap::new();
+        crd_selector.insert(
+            "modelregistry.ai-platform/instance".to_string(),
+            "model_registry_dev".to_string(),
+        );
+        let config = ServiceDiscoveryConfig {
+            crd_selector,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.crd_label_selector(),
+            "modelregistry.ai-platform/instance=model_registry_dev"
+        );
     }
 
     #[test]

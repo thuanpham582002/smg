@@ -337,6 +337,14 @@ struct CliArgs {
     )]
     service_discovery_crds: bool,
 
+    /// Label selector for SmgWorker CRD discovery (format: key=value, repeatable).
+    /// Empty = watch every SmgWorker in the namespace. Use this to scope one
+    /// gateway to a single producer's CRs when multiple model-registry instances
+    /// emit SmgWorkers into the same per-project namespace, e.g.
+    /// --service-discovery-crd-selector modelregistry.ai-platform/instance=model_registry_dev
+    #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
+    service_discovery_crd_selector: Vec<String>,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -1540,6 +1548,7 @@ impl CliArgs {
                 router_mesh_port_annotation,
                 model_id_source,
                 crd_workers: self.service_discovery_crds,
+                crd_selector: Self::parse_selector(&self.service_discovery_crd_selector),
             })
         } else {
             None
