@@ -21,6 +21,17 @@ use tracing::{debug, warn};
 
 const DEFAULT_TIMEOUT_MS: u64 = 500;
 
+/// The model-selector header authz resolves identity/region from. OpenAI-SDK
+/// clients carry the model only in the JSON body, so when this header is absent
+/// the middleware synthesizes it from `body.model` before calling authz —
+/// otherwise authz has no model to resolve and rejects the request.
+const MODEL_HEADER: &str = "x-ai-eg-model";
+
+/// Upper bound on the body buffered solely to extract `body.model` when the
+/// model header is missing. The real payload limit is enforced downstream by
+/// the DefaultBodyLimit layer; this only guards the synthesis read.
+const MAX_MODEL_PROBE_BYTES: usize = 1024 * 1024;
+
 /// HTTP headers forwarded from the inbound request to the ext-auth endpoint.
 /// The ext-auth handler reads identity solely from headers (body is empty),
 /// so this list is the input contract. Kept in lockstep with
@@ -134,6 +145,23 @@ pub async fn ext_auth_middleware(
         return next.run(request).await;
     };
 
+    // SDK clients send the model only in the body; authz reads it from a header.
+    // When the header is absent, buffer the body to recover body.model and feed
+    // it to authz. The synthesized value is forwarded to authz ONLY — it must
+    // not persist on the request, because authz RESOLVES the model (alias +
+    // region) and returns the routing model in its own x-ai-eg-model response
+    // header, which copy_inject_headers then lands (it skips headers already
+    // present, so a persisted synthesis would shadow the resolved value).
+    let mut synthesized_model: Option<String> = None;
+    if !request.headers().contains_key(MODEL_HEADER) {
+        let (req, model) = match recover_body_model(request).await {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+        request = req;
+        synthesized_model = model;
+    }
+
     let mut req_builder = state.client.post(url);
     let inbound_headers = request.headers().clone();
     for name in FORWARD_HEADERS {
@@ -142,6 +170,9 @@ pub async fn ext_auth_middleware(
                 req_builder = req_builder.header(*name, s);
             }
         }
+    }
+    if let Some(model) = synthesized_model.as_deref() {
+        req_builder = req_builder.header(MODEL_HEADER, model);
     }
 
     let resp = match req_builder.send().await {
@@ -179,6 +210,36 @@ pub async fn ext_auth_middleware(
 
     copy_inject_headers(&resp_headers, request.headers_mut());
     next.run(request).await
+}
+
+/// Buffers the request body and extracts `model` from the JSON payload so the
+/// caller can forward it to authz. The body is always reattached unchanged — a
+/// parse miss or non-JSON payload yields `None`, never a failure, so
+/// non-inference and malformed requests fall through untouched.
+async fn recover_body_model(
+    request: Request<Body>,
+) -> Result<(Request<Body>, Option<String>), Response> {
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_MODEL_PROBE_BYTES).await {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(error = %err, "ext-auth: failed to buffer body for model recovery");
+            return Err((StatusCode::BAD_REQUEST, "failed to read request body").into_response());
+        }
+    };
+
+    let model = serde_json::from_slice::<ModelProbe>(&bytes)
+        .ok()
+        .and_then(|p| p.model)
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+
+    Ok((Request::from_parts(parts, Body::from(bytes)), model))
+}
+
+#[derive(serde::Deserialize)]
+struct ModelProbe {
+    model: Option<String>,
 }
 
 fn copy_inject_headers(src: &HeaderMap, dst: &mut HeaderMap) {

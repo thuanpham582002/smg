@@ -493,13 +493,29 @@ pub async fn start_service_discovery(
             let crd_context = Arc::clone(&app_context);
             let crd_namespace = config.namespace.clone();
             let crd_selector = config.crd_label_selector();
+            // URLs of workers this gateway added FROM SmgWorker CRs. The watcher
+            // only emits Delete events for changes seen WHILE connected; CRs
+            // deleted during a watcher restart (e.g. after a crash or reconnect)
+            // never produce a Delete, orphaning the in-memory worker. A periodic
+            // reconcile diffs this set against the live CR list and prunes the
+            // stragglers — mirroring how pod discovery reconciles tracked_pods.
+            // Scoped to CRD-sourced URLs so config/pod workers are never touched.
+            let tracked_crd_urls = Arc::new(Mutex::new(HashSet::<String>::new()));
+            let crd_reconcile_interval = config.check_interval;
             #[expect(
                 clippy::disallowed_methods,
                 reason = "CRD discovery runs for the lifetime of the server"
             )]
             tokio::spawn(async move {
-                start_crd_worker_discovery(crd_workers, crd_context, crd_namespace, crd_selector)
-                    .await;
+                start_crd_worker_discovery(
+                    crd_workers,
+                    crd_context,
+                    crd_namespace,
+                    crd_selector,
+                    tracked_crd_urls,
+                    crd_reconcile_interval,
+                )
+                .await;
             });
         }
 
@@ -696,17 +712,45 @@ pub async fn start_service_discovery(
     Ok(handle)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CRD discovery wiring: api + context + scoping + reconcile state"
+)]
 async fn start_crd_worker_discovery(
     workers: Api<SmgWorker>,
     app_context: Arc<AppContext>,
     namespace: Option<String>,
     label_selector: String,
+    tracked_urls: Arc<Mutex<HashSet<String>>>,
+    reconcile_interval: Duration,
 ) {
     info!(
         "Starting SmgWorker CRD discovery | namespace: {} | selector: '{}'",
         namespace.as_deref().unwrap_or("<all>"),
         label_selector
     );
+
+    // Periodic reconcile: prune workers whose CR was deleted while the watcher
+    // was down (no Delete event is replayed on reconnect). Runs alongside the
+    // event stream; both update the same tracked_urls set.
+    {
+        let workers = workers.clone();
+        let ctx = Arc::clone(&app_context);
+        let tracked = Arc::clone(&tracked_urls);
+        let selector = label_selector.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "CRD reconcile runs for the lifetime of the server"
+        )]
+        tokio::spawn(async move {
+            let start = time::Instant::now() + reconcile_interval;
+            let mut interval = time::interval_at(start, reconcile_interval);
+            loop {
+                interval.tick().await;
+                reconcile_crd_workers(&workers, &selector, &tracked, &ctx).await;
+            }
+        });
+    }
 
     let mut retry_delay = Duration::from_secs(1);
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
@@ -722,13 +766,16 @@ async fn start_crd_worker_discovery(
         let watcher_ok = watcher(workers.clone(), watcher_config)
             .try_for_each(|event| {
                 let app_context = Arc::clone(&app_context);
+                let tracked = Arc::clone(&tracked_urls);
                 async move {
                     match event {
                         Event::Apply(worker) | Event::InitApply(worker) => {
-                            handle_crd_worker_apply(&worker, Arc::clone(&app_context)).await;
+                            handle_crd_worker_apply(&worker, Arc::clone(&app_context), &tracked)
+                                .await;
                         }
                         Event::Delete(worker) => {
-                            handle_crd_worker_delete(&worker, Arc::clone(&app_context)).await;
+                            handle_crd_worker_delete(&worker, Arc::clone(&app_context), &tracked)
+                                .await;
                         }
                         Event::Init | Event::InitDone => {}
                     }
@@ -755,7 +802,11 @@ async fn start_crd_worker_discovery(
     }
 }
 
-async fn handle_crd_worker_apply(worker: &SmgWorker, app_context: Arc<AppContext>) {
+async fn handle_crd_worker_apply(
+    worker: &SmgWorker,
+    app_context: Arc<AppContext>,
+    tracked_urls: &Arc<Mutex<HashSet<String>>>,
+) {
     let mut spec = worker.spec.worker.clone();
     if spec.api_key.is_none() {
         spec.api_key.clone_from(&app_context.router_config.api_key);
@@ -771,10 +822,15 @@ async fn handle_crd_worker_apply(worker: &SmgWorker, app_context: Arc<AppContext
 
     if let Some(job_queue) = app_context.worker_job_queue.get() {
         match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_registration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::REGISTRATION_SUCCESS,
-            ),
+            Ok(()) => {
+                if let Ok(mut tracked) = tracked_urls.lock() {
+                    tracked.insert(url.clone());
+                }
+                Metrics::record_discovery_registration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::REGISTRATION_SUCCESS,
+                )
+            }
             Err(e) => error!("Failed to submit SmgWorker addition for {}: {}", url, e),
         }
     } else {
@@ -782,7 +838,11 @@ async fn handle_crd_worker_apply(worker: &SmgWorker, app_context: Arc<AppContext
     }
 }
 
-async fn handle_crd_worker_delete(worker: &SmgWorker, app_context: Arc<AppContext>) {
+async fn handle_crd_worker_delete(
+    worker: &SmgWorker,
+    app_context: Arc<AppContext>,
+    tracked_urls: &Arc<Mutex<HashSet<String>>>,
+) {
     let url = worker.spec.worker.url.clone();
     let name = worker.metadata.name.as_deref().unwrap_or("<unknown>");
     info!("Deleting SmgWorker {} | url: {}", name, url);
@@ -794,14 +854,86 @@ async fn handle_crd_worker_delete(worker: &SmgWorker, app_context: Arc<AppContex
 
     if let Some(job_queue) = app_context.worker_job_queue.get() {
         match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_deregistration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::DEREGISTRATION_POD_DELETED,
-            ),
+            Ok(()) => {
+                if let Ok(mut tracked) = tracked_urls.lock() {
+                    tracked.remove(&url);
+                }
+                Metrics::record_discovery_deregistration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::DEREGISTRATION_POD_DELETED,
+                )
+            }
             Err(e) => error!("Failed to submit SmgWorker removal for {}: {}", url, e),
         }
     } else {
         error!("JobQueue not initialized, cannot remove SmgWorker {}", url);
+    }
+}
+
+/// Prune workers whose SmgWorker CR was deleted while the watcher was down (a
+/// reconnect replays Applies but never the missed Deletes). Lists CRs with the
+/// SAME label selector as the watch — so when several SMG gateways share a
+/// namespace, each reconciles only the CRs it owns and never evicts another
+/// gateway's workers. Only tracked-but-absent URLs are removed; re-adding live
+/// workers is left to the watcher's InitApply replay.
+async fn reconcile_crd_workers(
+    workers: &Api<SmgWorker>,
+    label_selector: &str,
+    tracked_urls: &Arc<Mutex<HashSet<String>>>,
+    app_context: &Arc<AppContext>,
+) {
+    let list_params = if label_selector.is_empty() {
+        ListParams::default()
+    } else {
+        ListParams::default().labels(label_selector)
+    };
+    let live: HashSet<String> = match workers.list(&list_params).await {
+        Ok(list) => list
+            .items
+            .iter()
+            .filter(|w| w.metadata.deletion_timestamp.is_none())
+            .map(|w| w.spec.worker.url.clone())
+            .collect(),
+        Err(e) => {
+            error!("CRD reconcile: failed to list SmgWorkers: {}", e);
+            return;
+        }
+    };
+
+    let stale: Vec<String> = match tracked_urls.lock() {
+        Ok(tracked) => tracked.difference(&live).cloned().collect(),
+        Err(e) => {
+            error!("CRD reconcile: tracked_urls lock poisoned: {}", e);
+            return;
+        }
+    };
+    if stale.is_empty() {
+        debug!("CRD reconcile: tracked workers consistent with K8s");
+        return;
+    }
+
+    info!("CRD reconcile: pruning {} stale SmgWorker(s)", stale.len());
+    let Some(job_queue) = app_context.worker_job_queue.get() else {
+        warn!("CRD reconcile: JobQueue not initialized, cannot prune stale workers");
+        return;
+    };
+    for url in &stale {
+        let job = Job::RemoveWorker {
+            url: url.clone(),
+            expected_revision: None,
+        };
+        match job_queue.submit(job).await {
+            Ok(()) => {
+                if let Ok(mut tracked) = tracked_urls.lock() {
+                    tracked.remove(url);
+                }
+                Metrics::record_discovery_deregistration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::DEREGISTRATION_RECONCILED,
+                );
+            }
+            Err(e) => error!("CRD reconcile: failed to submit removal for {}: {}", url, e),
+        }
     }
 }
 

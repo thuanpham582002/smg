@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7
+# Dev-iteration build: debug profile (no --release) so a one-file change in the
+# monolithic smg crate recompiles in ~2-3min instead of ~8min. Functionally
+# identical binary; slower runtime, acceptable for dev verification only.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler libprotobuf-dev clang libclang-dev cmake
+COPY . .
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build -p smg --bin smg \
+    && cp /src/target/debug/smg /usr/local/bin/smg
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/smg /usr/local/bin/smg
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/smg"]
