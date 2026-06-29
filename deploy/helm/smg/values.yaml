@@ -65,6 +65,18 @@ router:
   modelSelector:
     headerName: ""
 
+  # -- Kafka usage-event publishing. Each served request emits a usage event the
+  #    billing/metering consumer (e.g. model-registry usage consumer) deducts
+  #    credit from. Empty brokers = publishing disabled (no-op). The default
+  #    topic + header keys already match the model-registry ext-proc contract.
+  kafkaUsage:
+    brokers: ""            # comma-separated, e.g. kafka-bootstrap.kafka.svc.cluster.local:9092
+    topic: ""             # default "ai-gateway-events" when empty
+    saslMechanism: ""
+    saslUser: ""
+    saslPassword: ""
+    tlsEnabled: false
+
   # -- ConfigMap-backed runtime settings. Keeps auth/config changes out of Pod args.
   configMap:
     enabled: true

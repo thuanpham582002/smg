@@ -123,6 +123,43 @@ spec:
                   name: {{ include "smg.fullname" . }}-router-config
                   key: MODEL_SELECTOR_HEADER
                   optional: true
+            {{- if .Values.router.kafkaUsage.brokers }}
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_BROKERS
+            - name: KAFKA_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_TOPIC
+                  optional: true
+            - name: KAFKA_TLS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_TLS_ENABLED
+                  optional: true
+            - name: KAFKA_SASL_MECHANISM
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_SASL_MECHANISM
+                  optional: true
+            - name: KAFKA_SASL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_SASL_USER
+                  optional: true
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "smg.fullname" . }}-router-config
+                  key: KAFKA_SASL_PASSWORD
+                  optional: true
+            {{- end }}
             {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}

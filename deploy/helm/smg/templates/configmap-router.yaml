@@ -17,6 +17,18 @@ data:
   {{- if .Values.router.modelSelector.headerName }}
   MODEL_SELECTOR_HEADER: {{ .Values.router.modelSelector.headerName | quote }}
   {{- end }}
+  {{- if .Values.router.kafkaUsage.brokers }}
+  KAFKA_BROKERS: {{ .Values.router.kafkaUsage.brokers | quote }}
+  {{- if .Values.router.kafkaUsage.topic }}
+  KAFKA_TOPIC: {{ .Values.router.kafkaUsage.topic | quote }}
+  {{- end }}
+  KAFKA_TLS_ENABLED: {{ .Values.router.kafkaUsage.tlsEnabled | quote }}
+  {{- if .Values.router.kafkaUsage.saslMechanism }}
+  KAFKA_SASL_MECHANISM: {{ .Values.router.kafkaUsage.saslMechanism | quote }}
+  KAFKA_SASL_USER: {{ .Values.router.kafkaUsage.saslUser | quote }}
+  KAFKA_SASL_PASSWORD: {{ .Values.router.kafkaUsage.saslPassword | quote }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.router.configMap.extraData }}
   {{- toYaml . | nindent 2 }}
   {{- end }}
