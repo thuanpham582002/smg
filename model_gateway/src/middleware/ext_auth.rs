@@ -244,7 +244,14 @@ struct ModelProbe {
 
 fn copy_inject_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     for name in INJECT_HEADERS {
-        if dst.contains_key(*name) {
+        // The model header carries ext-auth's RESOLUTION (alias/region ->
+        // routing model), which is the whole point of calling auth, so it must
+        // overwrite whatever the client sent. A client that explicitly passes
+        // x-ai-eg-model: <alias> would otherwise shadow the resolved virtual
+        // model name and the router selects on the alias -> model_not_found.
+        // Every other injected header is passthrough identity, kept only when
+        // the request didn't already carry it.
+        if *name != MODEL_HEADER && dst.contains_key(*name) {
             continue;
         }
 
