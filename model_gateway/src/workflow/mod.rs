@@ -25,6 +25,7 @@ pub use mcp_registration::{
 };
 pub use steps::{
     // Unified workflow builder + data factory
+    create_external_worker_registration_workflow,
     create_worker_registration_workflow,
     // Removal/update workflow builders
     create_worker_removal_workflow,

@@ -54,6 +54,9 @@ use crate::{app_context::AppContext, config::RouterConfig, workflow::data::Worke
 ///      update_policies  submit_tok  activate_workers
 ///                       (local only)
 /// ```
+///
+/// Explicit external workers use `create_external_worker_registration_workflow`
+/// instead, so their registration is not gated by local backend discovery.
 pub fn create_worker_registration_workflow(
     router_config: &RouterConfig,
 ) -> WorkflowDefinition<WorkerWorkflowData> {
@@ -240,6 +243,85 @@ pub fn create_worker_registration_workflow(
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["register_workers"]),
         )
+}
+
+/// Create an external-only worker registration workflow definition.
+///
+/// This keeps explicit external workers out of the local detection branch. The
+/// unified workflow cannot express this safely with `depends_on_any` because
+/// skipped inactive dependencies count as satisfied and can trigger the join
+/// before the active branch has produced worker objects.
+pub fn create_external_worker_registration_workflow() -> WorkflowDefinition<WorkerWorkflowData> {
+    WorkflowDefinition::new(
+        "external_worker_registration",
+        "External Worker Registration",
+    )
+    .add_step(
+        StepDefinition::new(
+            "classify_worker_type",
+            "Classify Worker Type",
+            Arc::new(ClassifyWorkerTypeStep),
+        )
+        .with_timeout(Duration::from_secs(10))
+        .with_failure_action(FailureAction::FailWorkflow),
+    )
+    .add_step(
+        StepDefinition::new(
+            "discover_models",
+            "Discover Models",
+            Arc::new(DiscoverModelsStep),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        })
+        .with_timeout(Duration::from_secs(30))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["classify_worker_type"]),
+    )
+    .add_step(
+        StepDefinition::new(
+            "create_external_workers",
+            "Create External Workers",
+            Arc::new(CreateExternalWorkersStep),
+        )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_models"]),
+    )
+    .add_step(
+        StepDefinition::new(
+            "register_workers",
+            "Register Workers",
+            Arc::new(RegisterWorkersStep),
+        )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["create_external_workers"]),
+    )
+    .add_step(
+        StepDefinition::new(
+            "update_policies",
+            "Update Policies",
+            Arc::new(UpdatePoliciesStep),
+        )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&["register_workers"]),
+    )
+    .add_step(
+        StepDefinition::new(
+            "activate_workers",
+            "Activate Workers",
+            Arc::new(ActivateWorkersStep),
+        )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["register_workers"]),
+    )
 }
 
 /// Create initial workflow data for the unified worker registration workflow.

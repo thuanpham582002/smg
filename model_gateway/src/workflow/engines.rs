@@ -8,12 +8,12 @@ use std::sync::Arc;
 use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
 
 use super::{
-    create_mcp_registration_workflow, create_tokenizer_registration_workflow,
-    create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-    create_worker_registration_workflow, create_worker_removal_workflow,
-    create_worker_update_workflow, McpWorkflowData, TokenizerWorkflowData,
-    WasmRegistrationWorkflowData, WasmRemovalWorkflowData, WorkerRemovalWorkflowData,
-    WorkerUpdateWorkflowData,
+    create_external_worker_registration_workflow, create_mcp_registration_workflow,
+    create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
+    create_wasm_module_removal_workflow, create_worker_registration_workflow,
+    create_worker_removal_workflow, create_worker_update_workflow, McpWorkflowData,
+    TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
+    WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
 use crate::{config::RouterConfig, workflow::data::WorkerWorkflowData};
 
@@ -50,8 +50,10 @@ pub type WasmRemovalEngine =
 /// This replaces the old `WorkflowEngine<AnyWorkflowData, ...>` approach.
 #[derive(Clone, Debug)]
 pub struct WorkflowEngines {
-    /// Engine for unified worker registration workflows (local + external)
+    /// Engine for unified worker registration workflows (local + implicit external)
     pub worker_registration: Arc<WorkerRegistrationEngine>,
+    /// Engine for explicit external worker registration workflows
+    pub external_worker_registration: Arc<WorkerRegistrationEngine>,
     /// Engine for worker removal workflows
     pub worker_removal: Arc<WorkerRemovalEngine>,
     /// Engine for worker update workflows
@@ -78,6 +80,12 @@ impl WorkflowEngines {
         worker_registration
             .register_workflow(create_worker_registration_workflow(router_config))
             .expect("worker_registration workflow should be valid");
+
+        // Create explicit external worker registration engine
+        let external_worker_registration = WorkflowEngine::new();
+        external_worker_registration
+            .register_workflow(create_external_worker_registration_workflow())
+            .expect("external_worker_registration workflow should be valid");
 
         // Create worker removal engine
         let worker_removal = WorkflowEngine::new();
@@ -116,6 +124,7 @@ impl WorkflowEngines {
 
         Self {
             worker_registration: Arc::new(worker_registration),
+            external_worker_registration: Arc::new(external_worker_registration),
             worker_removal: Arc::new(worker_removal),
             worker_update: Arc::new(worker_update),
             mcp: Arc::new(mcp),
@@ -128,6 +137,10 @@ impl WorkflowEngines {
     /// Subscribe an event subscriber to all workflow engines
     pub async fn subscribe_all<S: EventSubscriber + 'static>(&self, subscriber: Arc<S>) {
         self.worker_registration
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.external_worker_registration
             .event_bus()
             .subscribe(subscriber.clone())
             .await;

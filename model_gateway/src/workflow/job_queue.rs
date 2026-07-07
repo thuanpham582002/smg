@@ -321,19 +321,26 @@ impl JobQueue {
 
                 let workflow_data =
                     create_worker_workflow_data((**config).clone(), Arc::clone(context));
-                let instance_id = engines
-                    .worker_registration
-                    .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
+                let (engine, workflow_id) = if config.runtime_type == RuntimeType::External {
+                    (
+                        &engines.external_worker_registration,
+                        "external_worker_registration",
+                    )
+                } else {
+                    (&engines.worker_registration, "worker_registration")
+                };
+
+                let instance_id = engine
+                    .start_workflow(WorkflowId::new(workflow_id), workflow_data)
                     .await
-                    .map_err(|e| format!("Failed to start worker registration workflow: {e:?}"))?;
+                    .map_err(|e| format!("Failed to start {workflow_id} workflow: {e:?}"))?;
 
                 debug!(
-                    "Started worker registration workflow for {} (instance: {})",
-                    config.url, instance_id
+                    "Started {} workflow for {} (instance: {})",
+                    workflow_id, config.url, instance_id
                 );
 
-                engines
-                    .worker_registration
+                engine
                     .wait_for_completion(instance_id, &config.url, timeout_duration)
                     .await
             }

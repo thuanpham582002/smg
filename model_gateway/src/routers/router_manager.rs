@@ -314,13 +314,12 @@ impl RouterManager {
             })
     }
 
-    /// Build a response from self-hosted registry models (excludes external workers).
+    /// Build a response from models already registered with this gateway.
     fn registry_models_response(&self) -> Response {
         let cards: Vec<_> = self
             .worker_registry
             .get_all()
             .iter()
-            .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
             .flat_map(|w| w.models())
             .collect();
         if cards.is_empty() {
@@ -961,6 +960,29 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn registry_models_response_includes_explicit_external_worker_models() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("http://external.example")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Http)
+            .runtime_type(RuntimeType::External)
+            .models(vec![ModelCard::new("crd-model")])
+            .circuit_breaker_config(CircuitBreakerConfig::default())
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+
+        let manager = RouterManager::new(registry, reqwest::Client::new());
+        let response = manager.registry_models_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"][0]["id"], "crd-model");
     }
 
     #[test]
