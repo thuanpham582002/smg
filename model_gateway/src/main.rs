@@ -14,6 +14,7 @@ use smg::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
+    security_policy::SecurityPolicyConfig,
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
     version,
@@ -344,6 +345,22 @@ struct CliArgs {
     /// --service-discovery-crd-selector modelregistry.ai-platform/instance=model_registry_dev
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
     service_discovery_crd_selector: Vec<String>,
+
+    /// Watch SmgSecurityPolicy CRDs and reconcile data-plane ext-auth config.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Security Policy (Kubernetes)"
+    )]
+    security_policies: bool,
+
+    /// SmgGateway target name this router should accept SmgSecurityPolicy targetRefs for.
+    #[arg(
+        long,
+        env = "SMG_GATEWAY_NAME",
+        help_heading = "Security Policy (Kubernetes)"
+    )]
+    smg_gateway_name: Option<String>,
 
     // ==================== Logging ====================
     /// Directory to store log files
@@ -1574,6 +1591,13 @@ impl CliArgs {
             }
         };
 
+        let security_policy_config = self.security_policies.then(|| SecurityPolicyConfig {
+            enabled: true,
+            namespace: self.service_discovery_namespace.clone(),
+            target_name: self.smg_gateway_name.clone(),
+            check_interval: std::time::Duration::from_secs(60),
+        });
+
         // ==================== Mesh Server ====================
         let mesh_server_config = self.build_mesh_server_config()?;
 
@@ -1602,6 +1626,7 @@ impl CliArgs {
                     .with_timeout_ms(self.ext_auth_timeout_ms)
                     .with_fail_open_on_transport_error(self.ext_auth_fail_open_on_transport_error)
             }),
+            security_policy_config,
             mesh_server_config,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server.clone(),

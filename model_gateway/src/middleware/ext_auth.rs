@@ -7,7 +7,7 @@
 //! request that proceeds to the chosen worker — matching the Envoy ext-authz
 //! contract used by the AI Gateway.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use reqwest::Client;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 const DEFAULT_TIMEOUT_MS: u64 = 500;
@@ -101,6 +102,10 @@ impl ExtAuthConfig {
         }
     }
 
+    pub fn disabled() -> Self {
+        Self::new(None)
+    }
+
     pub fn with_timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = ms;
         self
@@ -119,7 +124,7 @@ impl ExtAuthConfig {
 /// Runtime state: a shared reqwest client + the resolved config.
 #[derive(Clone)]
 pub struct ExtAuthState {
-    config: ExtAuthConfig,
+    config: Arc<RwLock<ExtAuthConfig>>,
     client: Client,
 }
 
@@ -128,8 +133,12 @@ impl ExtAuthState {
         if !config.is_enabled() {
             return None;
         }
+        Self::new_shared(Arc::new(RwLock::new(config)))
+    }
+
+    pub fn new_shared(config: Arc<RwLock<ExtAuthConfig>>) -> Option<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
+            .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
             .build()
             .ok()?;
         Some(Self { config, client })
@@ -141,7 +150,8 @@ pub async fn ext_auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(url) = state.config.url.as_deref() else {
+    let config = state.config.read().await.clone();
+    let Some(url) = config.url.clone() else {
         return next.run(request).await;
     };
 
@@ -162,7 +172,10 @@ pub async fn ext_auth_middleware(
         synthesized_model = model;
     }
 
-    let mut req_builder = state.client.post(url);
+    let mut req_builder = state
+        .client
+        .post(&url)
+        .timeout(Duration::from_millis(config.timeout_ms));
     let inbound_headers = request.headers().clone();
     for name in FORWARD_HEADERS {
         if let Some(value) = inbound_headers.get(*name) {
@@ -179,7 +192,7 @@ pub async fn ext_auth_middleware(
         Ok(r) => r,
         Err(err) => {
             warn!(error = %err, url = url, "ext-auth transport error");
-            if state.config.fail_open_on_transport_error {
+            if config.fail_open_on_transport_error {
                 return next.run(request).await;
             }
             return (

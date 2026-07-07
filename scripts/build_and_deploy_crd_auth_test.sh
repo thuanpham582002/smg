@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NAMESPACE="${NAMESPACE:-aip-5f62e802acfe4cb9a64cd08671156f0b}"
+NAMESPACE="${NAMESPACE:-smg-crd-auth-test}"
 RELEASE="${RELEASE:-smg-crd-auth-test}"
 IMAGE_REPO="${IMAGE_REPO:-smg}"
 IMAGE_TAG="${IMAGE_TAG:-crd-auth-test}"
@@ -48,7 +48,11 @@ fi
 
 kubectl apply --server-side -f "${CHART_DIR}/crds/smgworkers.yaml"
 kubectl apply --server-side -f "${CHART_DIR}/crds/smggateways.yaml"
-kubectl apply --server-side -f "${CHART_DIR}/examples/aip-selfheal-test-cr.yaml"
+kubectl apply --server-side -f "${CHART_DIR}/crds/smgsecuritypolicies.yaml"
+
+if [[ "${APPLY_EXAMPLE_RESOURCES:-0}" == "1" ]]; then
+  kubectl apply --server-side -f "${CHART_DIR}/examples/aip-selfheal-test-cr.yaml"
+fi
 
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
@@ -60,6 +64,8 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   --set router.policy=weighted_sticky \
   --set router.serviceDiscovery.crds.enabled=true \
   --set router.serviceDiscovery.namespace="${NAMESPACE}" \
+  --set router.securityPolicies.enabled=true \
+  --set router.securityPolicies.gatewayName="${SMG_GATEWAY_NAME:-selfheal-test}" \
   --set router.extAuth.url="${AUTH_URL}" \
   --set router.extAuth.timeoutMs=500 \
   --set router.extAuth.failOpenOnTransportError=false \

@@ -165,6 +165,17 @@ Called from the router Deployment template.
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.router.securityPolicies.enabled }}
+- "--security-policies"
+{{- if .Values.router.securityPolicies.gatewayName }}
+- "--smg-gateway-name"
+- {{ .Values.router.securityPolicies.gatewayName | quote }}
+{{- end }}
+{{- if and (not .Values.router.serviceDiscovery.enabled) (not .Values.router.serviceDiscovery.crds.enabled) (not .Values.router.serviceDiscovery.clusterWide) }}
+- "--service-discovery-namespace"
+- {{ .Values.router.serviceDiscovery.namespace | default .Release.Namespace | quote }}
+{{- end }}
+{{- end }}
 {{- if and .Values.router.extAuth.url (not .Values.router.configMap.enabled) }}
 - "--ext-auth-url"
 - {{ .Values.router.extAuth.url | quote }}

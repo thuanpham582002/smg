@@ -40,7 +40,10 @@ use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
-use tokio::{signal, spawn, sync::mpsc};
+use tokio::{
+    signal, spawn,
+    sync::{mpsc, RwLock},
+};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -58,6 +61,7 @@ use crate::{
         conversations, openai::realtime::ws::RealtimeQueryParams, parse,
         responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
     },
+    security_policy::{start_security_policy_reconciliation, SecurityPolicyConfig},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::manager::{WorkerManager, WorkerManagerConfig},
@@ -724,6 +728,7 @@ pub struct ServerConfig {
     /// its `url` is set, every protected inference request is gated by a POST
     /// to the configured ext-auth endpoint.
     pub ext_auth: Option<middleware::ExtAuthConfig>,
+    pub security_policy_config: Option<SecurityPolicyConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
@@ -1378,11 +1383,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
-    let ext_auth_state = config
+    let baseline_ext_auth_config = config
         .ext_auth
-        .as_ref()
-        .filter(|cfg| cfg.is_enabled())
-        .and_then(|cfg| middleware::ExtAuthState::try_init(cfg.clone()));
+        .clone()
+        .unwrap_or_else(middleware::ExtAuthConfig::disabled);
+    let ext_auth_config = Arc::new(RwLock::new(baseline_ext_auth_config.clone()));
+    let ext_auth_state = middleware::ExtAuthState::new_shared(Arc::clone(&ext_auth_config));
     if let Some(cfg) = config.ext_auth.as_ref() {
         if let Some(url) = cfg.url.as_deref() {
             info!(
@@ -1391,6 +1397,28 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 fail_open = cfg.fail_open_on_transport_error,
                 "ext-auth middleware enabled"
             );
+        }
+    }
+    if let Some(security_policy_config) = config.security_policy_config.clone() {
+        match start_security_policy_reconciliation(
+            security_policy_config,
+            Arc::clone(&ext_auth_config),
+            baseline_ext_auth_config,
+        )
+        .await
+        {
+            Ok(handle) => {
+                info!("SmgSecurityPolicy reconciliation started");
+                spawn(async move {
+                    if let Err(e) = handle.await {
+                        error!("SmgSecurityPolicy reconciliation task failed: {:?}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to start SmgSecurityPolicy reconciliation: {e}");
+                warn!("Continuing without SmgSecurityPolicy reconciliation");
+            }
         }
     }
 

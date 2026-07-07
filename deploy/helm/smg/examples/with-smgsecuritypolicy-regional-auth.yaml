@@ -1,0 +1,42 @@
+apiVersion: smg.lightseek.io/v1alpha1
+kind: SmgSecurityPolicy
+metadata:
+  name: inference-auth
+spec:
+  targetRefs:
+    - group: smg.lightseek.io
+      kind: SmgGateway
+      name: regional
+  extAuth:
+    failOpen: false
+    bodyToExtAuth:
+      maxRequestBytes: 262144
+    headersToExtAuth:
+      - authorization
+      - x-ai-eg-model
+      - x-request-id
+      - x-project-id
+      - x-user-id
+      - x-region-id
+      - region-id
+    http:
+      path: /ext-auth
+      backendRef:
+        name: regional-auth-backend
+        port: 8080
+      headersToBackend:
+        - authorization
+        - x-ai-eg-model
+        - x-request-id
+        - x-api-key-id
+        - x-project-id
+        - x-model-id
+        - x-model-name
+        - x-input-price
+        - x-output-price
+        - x-credit-remaining
+        - x-is-free
+        - x-rate-limit-remaining
+        - x-user-id
+        - x-maas-concurrency-slot
+        - x-maas-model-concurrency-slot

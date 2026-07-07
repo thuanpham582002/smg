@@ -1,0 +1,94 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: smgsecuritypolicies.smg.lightseek.io
+spec:
+  group: smg.lightseek.io
+  names:
+    kind: SmgSecurityPolicy
+    listKind: SmgSecurityPolicyList
+    plural: smgsecuritypolicies
+    singular: smgsecuritypolicy
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [targetRefs]
+              properties:
+                targetRefs:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [kind, name]
+                    properties:
+                      group:
+                        type: string
+                        default: smg.lightseek.io
+                      kind:
+                        type: string
+                        enum: [SmgGateway, SmgWorker]
+                      name:
+                        type: string
+                        minLength: 1
+                extAuth:
+                  type: object
+                  required: [http]
+                  properties:
+                    failOpen:
+                      type: boolean
+                      default: false
+                    bodyToExtAuth:
+                      type: object
+                      properties:
+                        maxRequestBytes:
+                          type: integer
+                          minimum: 1
+                          default: 262144
+                    headersToExtAuth:
+                      type: array
+                      items:
+                        type: string
+                    http:
+                      type: object
+                      required: [backendRef]
+                      properties:
+                        path:
+                          type: string
+                          default: /ext-auth
+                        backendRef:
+                          type: object
+                          required: [name, port]
+                          properties:
+                            name:
+                              type: string
+                              minLength: 1
+                            namespace:
+                              type: string
+                            port:
+                              type: integer
+                              minimum: 1
+                              maximum: 65535
+                        headersToBackend:
+                          type: array
+                          items:
+                            type: string
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                ready:
+                  type: boolean
+                reason:
+                  type: string
+      subresources:
+        status: {}

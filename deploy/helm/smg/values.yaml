@@ -60,6 +60,13 @@ router:
     timeoutMs: 500
     failOpenOnTransportError: false
 
+  # -- Watch smg.lightseek.io/v1alpha1 SmgSecurityPolicy resources. The CRD is
+  #    installed by Helm from crds/; runtime reconciliation is intentionally
+  #    separate from Envoy Gateway SecurityPolicy semantics.
+  securityPolicies:
+    enabled: false
+    gatewayName: ""
+
   # -- Request header used as the public model selector before falling back to body.model.
   #    Leave empty to disable header-based model selection.
   modelSelector:

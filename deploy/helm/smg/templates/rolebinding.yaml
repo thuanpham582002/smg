@@ -1,4 +1,4 @@
-{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.serviceDiscovery.crds.enabled .Values.router.mesh.enabled }}
+{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.serviceDiscovery.crds.enabled .Values.router.securityPolicies.enabled .Values.router.mesh.enabled }}
 apiVersion: rbac.authorization.k8s.io/v1
 {{- if .Values.router.serviceDiscovery.clusterWide }}
 kind: ClusterRoleBinding
